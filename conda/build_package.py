@@ -40,6 +40,8 @@ RUNTIME_DEPENDENCIES = {
     "cpu": {
         "linux-64": [
             "mkl >=2025",
+            "libllvm22 >=22.1,<23",
+            "libclang-cpp >=22.1,<23",
             "libgomp",
             "libstdcxx-ng",
             "libgcc-ng",
@@ -48,12 +50,16 @@ RUNTIME_DEPENDENCIES = {
             "openblas >=0.3",
             "fftw >=3.3",
             "liblapacke >=3.11",
+            "libllvm22 >=22.1,<23",
+            "libclang-cpp >=22.1,<23",
             "libgomp",
             "libstdcxx-ng",
             "libgcc-ng",
         ],
         "win-64": [
             "mkl >=2025",
+            "libllvm22 >=22.1,<23",
+            "libclang-cpp >=22.1,<23",
             "vc14_runtime",
             "ucrt",
             "llvm-openmp",
@@ -62,8 +68,32 @@ RUNTIME_DEPENDENCIES = {
             "openblas >=0.3",
             "fftw >=3.3",
             "liblapacke >=3.11",
+            "libllvm22 >=22.1,<23",
+            "libclang-cpp >=22.1,<23",
             "llvm-openmp",
             "libcxx",
+        ],
+    },
+    "cpu-mpi": {
+        "linux-64": [
+            "mkl >=2025",
+            "openmpi >=5,<6",
+            "libllvm22 >=22.1,<23",
+            "libclang-cpp >=22.1,<23",
+            "libgomp",
+            "libstdcxx-ng",
+            "libgcc-ng",
+        ],
+        "linux-aarch64": [
+            "openblas >=0.3",
+            "fftw >=3.3",
+            "liblapacke >=3.11",
+            "openmpi >=5,<6",
+            "libllvm22 >=22.1,<23",
+            "libclang-cpp >=22.1,<23",
+            "libgomp",
+            "libstdcxx-ng",
+            "libgcc-ng",
         ],
     },
     "cuda12": {
@@ -219,7 +249,9 @@ def patch_binary_rpath(files: list[tuple[Path, str]]) -> None:
             continue
         patch_cmd[-1] = str(src_path)
         try:
-            subprocess.run(patch_cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                patch_cmd, check=True, capture_output=True, text=True
+            )
             print(f"Patched RPATH: {src_path} -> {rpath_arg}")
         except FileNotFoundError:
             if system == "linux":

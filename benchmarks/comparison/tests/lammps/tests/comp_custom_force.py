@@ -1,5 +1,4 @@
 import shutil
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +13,7 @@ from utils import (
     extract_sponge_pressure,
     extract_sponge_stress,
     print_validation_table,
+    run_sponge_command,
     write_lammps_data,
     write_sponge_coords,
     write_sponge_mass,
@@ -21,12 +21,7 @@ from utils import (
 
 
 def _run_sponge(sponge_dir: Path):
-    subprocess.run(
-        ["SPONGE", "-mdin", "mdin.spg.toml"],
-        cwd=sponge_dir,
-        check=True,
-        capture_output=True,
-    )
+    run_sponge_command(sponge_dir, mdin_file="mdin.spg.toml")
 
 
 def _validate_lammps_vs_sponge(
@@ -290,20 +285,20 @@ def test_custom_pairwise_morse_vs_lammps(iteration, outputs_path, statics_path):
     (sponge_dir / "mdin.spg.toml").write_text(
         "\n".join(
             [
-                "custom pairwise morse run0",
-                "mode = nve",
+                "# custom pairwise morse run0",
+                'mode = "nve"',
                 "dt = 0",
                 "step_limit = 0",
                 "cutoff = 8.0",
                 "skin = 2.0",
-                "default_in_file_prefix = system/test",
+                'default_in_file_prefix = "system/test"',
                 "print_pressure = 1",
                 "print_zeroth_frame = 1",
                 "write_trajectory_interval = 1",
                 "write_mdout_interval = 1",
-                "frc = frc.dat",
-                "pairwise_force_in_file = pairwise_force.txt",
-                "morse_force_in_file = morse-force_in_file.txt",
+                'frc = "frc.dat"',
+                'pairwise_force_in_file = "pairwise_force.txt"',
+                'morse_force_in_file = "morse-force_in_file.txt"',
                 "",
             ]
         )
@@ -436,20 +431,20 @@ def test_custom_listed_class2_vs_lammps(iteration, outputs_path, statics_path):
     (sponge_dir / "mdin.spg.toml").write_text(
         "\n".join(
             [
-                "custom listed class2 run0",
-                "mode = nve",
+                "# custom listed class2 run0",
+                'mode = "nve"',
                 "dt = 0",
                 "step_limit = 0",
                 "cutoff = 8.0",
                 "skin = 2.0",
-                "default_in_file_prefix = system/test",
+                'default_in_file_prefix = "system/test"',
                 "print_pressure = 1",
                 "print_zeroth_frame = 1",
                 "write_trajectory_interval = 1",
                 "write_mdout_interval = 1",
-                "frc = frc.dat",
-                "listed_forces_in_file = listed_force.txt",
-                "class2_bond_in_file = class2-bond_in_file.txt",
+                'frc = "frc.dat"',
+                'listed_forces_in_file = "listed_force.txt"',
+                'class2_bond_in_file = "class2-bond_in_file.txt"',
                 "",
             ]
         )

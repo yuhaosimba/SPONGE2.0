@@ -1,0 +1,73 @@
+name: Benchmark
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+jobs:
+  benchmark-cpu:
+    name: SPONGE-CPU Benchmark (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature: cpu
+            env_name: dev-cpu
+            target: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - feature: cpu
+            env_name: dev-cpu
+            target: linux-64
+            runner: ubuntu-22.04
+          - feature: cpu
+            env_name: dev-cpu
+            target: win-64
+            runner: windows-2022
+          - feature: cpu
+            env_name: dev-cpu
+            target: osx-arm64
+            runner: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@v0
+        with:
+          run-install: false
+
+      - name: Install dev-cpu environment
+        run: pixi install -e ${{ matrix.env_name }}
+
+      - name: Format check
+        run: pixi run -e ${{ matrix.env_name }} format-check
+
+      - name: Configure SPONGE-CPU
+        run: pixi run -e ${{ matrix.env_name }} configure
+
+      - name: Compile SPONGE-CPU
+        run: pixi run -e ${{ matrix.env_name }} compile
+
+      - name: Benchmark comparison/lammps
+        run: pixi run -e ${{ matrix.env_name }} comp-lammps
+
+      - name: Benchmark comparison/pyscf
+        run: pixi run -e ${{ matrix.env_name }} comp-pyscf
+
+      - name: Benchmark comparison/amber
+        run: pixi run -e ${{ matrix.env_name }} comp-amber
+
+      - name: Benchmark comparison/gromacs
+        run: pixi run -e ${{ matrix.env_name }} comp-gromacs

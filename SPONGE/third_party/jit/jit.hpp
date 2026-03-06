@@ -7,6 +7,21 @@ directly compiling for CPU backend
 #include "../../common.h"
 #include "../../control.h"
 
+namespace sponge_jit_detail
+{
+inline const std::string& Embedded_Common_Header()
+{
+    static const std::string header = []()
+    {
+        std::string value;
+        value.reserve(65536);
+#include "jit.h"
+        return value;
+    }();
+    return header;
+}
+}  // namespace sponge_jit_detail
+
 #ifdef USE_CUDA
 struct JIT_Function
 {
@@ -18,9 +33,8 @@ struct JIT_Function
 
     void Compile(std::string source)
     {
-        std::string common_h =
-#include "jit.h"
-            const char* headers[1] = {common_h.c_str()};
+        std::string common_h = sponge_jit_detail::Embedded_Common_Header();
+        const char* headers[1] = {common_h.c_str()};
         const char* header_names[1] = {"common.h"};
         nvrtcProgram prog;
         nvrtcCreateProgram(&prog, source.c_str(), NULL, 1, headers,
@@ -104,16 +118,493 @@ struct JIT_Function
 };
 #else
 
+#include <clang/Basic/Diagnostic.h>
+#include <clang/Basic/DiagnosticOptions.h>
+#include <clang/Basic/FileManager.h>
+#include <clang/Basic/TargetInfo.h>
+#include <clang/Basic/TargetOptions.h>
+#include <clang/CodeGen/CodeGenAction.h>
+#include <clang/Frontend/CompilerInstance.h>
+#include <clang/Frontend/CompilerInvocation.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <clang/Lex/PreprocessorOptions.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/Host.h>
+#include <llvm/TargetParser/Triple.h>
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
+#include <algorithm>
+#include <cstdlib>
+#include <mutex>
+#include <vector>
+
 struct JIT_Function
 {
    private:
-    std::string temp_string;
-    void (*function)(void** args);
+    void (*function)(void** args) = nullptr;
+    std::unique_ptr<llvm::orc::LLJIT> jit_engine;
+
+    static void Initialize_ORC_Runtime()
+    {
+        static std::once_flag init_once;
+        std::call_once(init_once,
+                       []()
+                       {
+                           llvm::InitializeNativeTarget();
+                           llvm::InitializeNativeTargetAsmPrinter();
+                       });
+    }
+
+#if defined(__linux__)
+    static void Push_Unique_Candidate(std::vector<std::string>& candidates,
+                                      const std::string& candidate)
+    {
+        if (candidate.empty())
+        {
+            return;
+        }
+        if (std::find(candidates.begin(), candidates.end(), candidate) ==
+            candidates.end())
+        {
+            candidates.push_back(candidate);
+        }
+    }
+
+    static std::vector<std::string> Build_Runtime_Candidates(
+        std::initializer_list<const char*> lib_names)
+    {
+        std::vector<std::string> candidates;
+        const char* conda_prefix = std::getenv("CONDA_PREFIX");
+        if (conda_prefix != nullptr && conda_prefix[0] != '\0')
+        {
+            std::string lib_dir = std::string(conda_prefix) + "/lib/";
+            for (const char* lib_name : lib_names)
+            {
+                Push_Unique_Candidate(candidates, lib_dir + lib_name);
+            }
+        }
+        for (const char* lib_name : lib_names)
+        {
+            Push_Unique_Candidate(candidates, lib_name);
+        }
+        return candidates;
+    }
+
+    static std::vector<std::string> Build_OpenMP_Runtime_Candidates()
+    {
+        return Build_Runtime_Candidates(
+            {"libomp.so", "libomp.so.5", "libiomp5.so", "libgomp.so.1"});
+    }
+
+    static std::vector<std::string> Build_Libatomic_Candidates()
+    {
+        return Build_Runtime_Candidates({"libatomic.so.1"});
+    }
+
+    static std::string Join_Candidates(
+        const std::vector<std::string>& candidates)
+    {
+        std::string joined;
+        for (const auto& candidate : candidates)
+        {
+            if (!joined.empty())
+            {
+                joined += ", ";
+            }
+            joined += candidate;
+        }
+        return joined;
+    }
+
+    static bool Try_Load_Runtime_Library(
+        const std::vector<std::string>& candidates, void** loaded_handle,
+        std::string* loaded_path, std::string* load_error,
+        const char* required_symbol = nullptr)
+    {
+        if (loaded_handle != nullptr)
+        {
+            *loaded_handle = nullptr;
+        }
+        if (loaded_path != nullptr)
+        {
+            loaded_path->clear();
+        }
+        for (const auto& candidate : candidates)
+        {
+            dlerror();
+            void* handle = dlopen(candidate.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+            if (handle == nullptr)
+            {
+                continue;
+            }
+            if (required_symbol != nullptr &&
+                dlsym(handle, required_symbol) == nullptr)
+            {
+                dlclose(handle);
+                continue;
+            }
+            if (loaded_handle != nullptr)
+            {
+                *loaded_handle = handle;
+            }
+            if (loaded_path != nullptr)
+            {
+                *loaded_path = candidate;
+            }
+            if (load_error != nullptr)
+            {
+                load_error->clear();
+            }
+            return true;
+        }
+        if (load_error != nullptr)
+        {
+            const char* err = dlerror();
+            *load_error = "Fail to load runtime library (tried: " +
+                          Join_Candidates(candidates) + ")";
+            if (required_symbol != nullptr)
+            {
+                *load_error += ", required symbol: ";
+                *load_error += required_symbol;
+            }
+            *load_error += ": ";
+            *load_error += (err != nullptr) ? err : "unknown error";
+        }
+        return false;
+    }
+#endif
+
+    static bool Ensure_OpenMP_Runtime_Loaded(std::string& load_error)
+    {
+#if defined(__linux__)
+        static std::once_flag load_once;
+        static bool load_success = false;
+        static std::string load_failure_reason;
+        static void* openmp_handle = nullptr;
+        static std::string openmp_runtime_path;
+        std::call_once(
+            load_once,
+            []()
+            {
+                const auto openmp_candidates =
+                    Build_OpenMP_Runtime_Candidates();
+                if (!Try_Load_Runtime_Library(
+                        openmp_candidates, &openmp_handle, &openmp_runtime_path,
+                        &load_failure_reason, "__kmpc_fork_call"))
+                {
+                    return;
+                }
+                load_success = true;
+
+                const auto libatomic_candidates = Build_Libatomic_Candidates();
+                void* libatomic_handle = nullptr;
+                std::string libatomic_path;
+                std::string ignored_error;
+                Try_Load_Runtime_Library(libatomic_candidates,
+                                         &libatomic_handle, &libatomic_path,
+                                         &ignored_error);
+                if (libatomic_handle != nullptr)
+                {
+                    (void)libatomic_handle;
+                }
+            });
+        if (!load_success)
+        {
+            load_error = load_failure_reason;
+            return false;
+        }
+#else
+        (void)load_error;
+#endif
+        load_error.clear();
+        return true;
+    }
+
+    static const std::string& InMemory_Common_Header()
+    {
+        static const std::string header = []()
+        {
+            std::string value = R"CPRE(
+#ifndef __CUDACC__
+#define __device__
+#define __host__
+#define __global__
+#define __forceinline__ inline
+#define __launch_bounds__(THREADS)
+struct sponge_jit_dim3
+{
+    unsigned int x;
+    unsigned int y;
+    unsigned int z;
+};
+static sponge_jit_dim3 threadIdx = {0u, 0u, 0u};
+__forceinline__ unsigned int __ballot_sync(unsigned int, int pred)
+{
+    return pred ? 0xffffffffu : 0u;
+}
+template <typename T>
+__forceinline__ T __shfl_down_sync(unsigned int, T value, int)
+{
+    return value;
+}
+__forceinline__ float atomicAdd(float* x, float y);
+__forceinline__ int atomicAdd(int* x, int y);
+__forceinline__ double atomicAdd(double* x, double y);
+__forceinline__ float rnorm3df(float x, float y, float z);
+extern "C" float powf(float x, float y);
+extern "C" float expf(float x);
+extern "C" float erfcf(float x);
+extern "C" float logf(float x);
+extern "C" float sqrtf(float x);
+extern "C" float cbrtf(float x);
+extern "C" float cosf(float x);
+extern "C" float sinf(float x);
+extern "C" float tanf(float x);
+extern "C" float acosf(float x);
+extern "C" float asinf(float x);
+extern "C" float atanf(float x);
+extern "C" float atan2f(float y, float x);
+extern "C" float fabsf(float x);
+extern "C" float copysignf(float x, float y);
+extern "C" float fmaxf(float x, float y);
+extern "C" float fminf(float x, float y);
+extern "C" float floorf(float x);
+#ifndef NULL
+#define NULL 0
+#endif
+#ifndef warpSize
+#define warpSize 0
+#endif
+#endif
+)CPRE";
+            value += sponge_jit_detail::Embedded_Common_Header();
+            return value;
+        }();
+        return header;
+    }
+
+    bool Build_Module_From_Source(const std::string& source,
+                                  llvm::LLVMContext& llvm_context,
+                                  std::unique_ptr<llvm::Module>& output_module)
+    {
+        constexpr const char* kInputFile = "sponge_jit_runtime_input.cpp";
+        constexpr const char* kCommonHeader = "#include \"common.h\"";
+        std::string source_with_header = source;
+        const std::string& common_header = InMemory_Common_Header();
+        const auto include_pos = source_with_header.find(kCommonHeader);
+        if (include_pos == std::string::npos)
+        {
+            source_with_header = common_header + "\n" + source_with_header;
+        }
+        else
+        {
+            source_with_header.replace(
+                include_pos, std::string(kCommonHeader).size(), common_header);
+        }
+
+        std::vector<std::string> arg_storage = {
+            "-xc++", "-std=c++17",  "-fopenmp", "-O3",
+            "-w",    "-ffast-math", "-DUSE_CPU"};
+        arg_storage.push_back(kInputFile);
+
+        std::vector<const char*> arg_ptrs;
+        arg_ptrs.reserve(arg_storage.size());
+        for (const auto& arg : arg_storage)
+        {
+            arg_ptrs.push_back(arg.c_str());
+        }
+
+        std::string diag_log;
+        llvm::raw_string_ostream diag_stream(diag_log);
+        auto invocation = std::make_shared<clang::CompilerInvocation>();
+        clang::CompilerInstance compiler(invocation);
+        auto diag_client = std::make_unique<clang::TextDiagnosticPrinter>(
+            diag_stream, invocation->getDiagnosticOpts());
+        compiler.createDiagnostics(diag_client.release(), true);
+        if (!compiler.hasDiagnostics())
+        {
+            error_reason =
+                "Fail to initialize Clang diagnostics for JIT source";
+            return false;
+        }
+
+        bool parsed = clang::CompilerInvocation::CreateFromArgs(
+            *invocation, arg_ptrs, compiler.getDiagnostics(), "sponge-jit");
+        diag_stream.flush();
+        if (!parsed || compiler.getDiagnostics().hasErrorOccurred())
+        {
+            error_reason = "Fail to create Clang invocation for JIT source";
+            if (!diag_log.empty())
+            {
+                error_reason += ":\n";
+                error_reason += diag_log;
+            }
+            return false;
+        }
+
+        auto& target_options = compiler.getInvocation().getTargetOpts();
+        if (target_options.Triple.empty())
+        {
+            target_options.Triple = llvm::sys::getDefaultTargetTriple();
+        }
+        clang::TargetInfo* target_info = clang::TargetInfo::CreateTargetInfo(
+            compiler.getDiagnostics(), target_options);
+        if (target_info == nullptr)
+        {
+            error_reason = "Fail to create Clang target info for JIT source";
+            return false;
+        }
+        compiler.setTarget(target_info);
+        compiler.createFileManager();
+        compiler.createSourceManager();
+        compiler.getPreprocessorOpts().RetainRemappedFileBuffers = true;
+        compiler.getPreprocessorOpts().addRemappedFile(
+            kInputFile,
+            llvm::MemoryBuffer::getMemBufferCopy(source_with_header, kInputFile)
+                .release());
+
+        clang::EmitLLVMOnlyAction emit_action(&llvm_context);
+        if (!compiler.ExecuteAction(emit_action))
+        {
+            diag_stream.flush();
+            error_reason = "Fail to emit LLVM IR for JIT source";
+            if (!diag_log.empty())
+            {
+                error_reason += ":\n";
+                error_reason += diag_log;
+            }
+            return false;
+        }
+        output_module = emit_action.takeModule();
+        if (output_module == nullptr)
+        {
+            error_reason = "Clang emitted null LLVM module for JIT source";
+            return false;
+        }
+        return true;
+    }
+
+    bool Compile_With_ORC(const std::string& source,
+                          const std::string& func_name)
+    {
+        Initialize_ORC_Runtime();
+        std::string openmp_load_error;
+        if (!Ensure_OpenMP_Runtime_Loaded(openmp_load_error))
+        {
+            error_reason = openmp_load_error;
+            return false;
+        }
+        auto jit = llvm::orc::LLJITBuilder().create();
+        if (!jit)
+        {
+            error_reason =
+                "Fail to create LLJIT: " + llvm::toString(jit.takeError());
+            return false;
+        }
+        jit_engine = std::move(*jit);
+
+#if defined(__linux__)
+        const auto openmp_runtime_candidates =
+            Build_OpenMP_Runtime_Candidates();
+        bool openmp_generator_added = false;
+        for (const auto& candidate : openmp_runtime_candidates)
+        {
+            auto openmp_generator =
+                llvm::orc::DynamicLibrarySearchGenerator::Load(
+                    candidate.c_str(),
+                    jit_engine->getDataLayout().getGlobalPrefix());
+            if (!openmp_generator)
+            {
+                continue;
+            }
+            jit_engine->getMainJITDylib().addGenerator(
+                std::move(*openmp_generator));
+            openmp_generator_added = true;
+        }
+        if (!openmp_generator_added)
+        {
+            error_reason =
+                "Fail to create ORC symbol resolver for OpenMP runtime "
+                "(tried: " +
+                Join_Candidates(openmp_runtime_candidates) + ")";
+            return false;
+        }
+#endif
+
+        auto generator =
+            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+                jit_engine->getDataLayout().getGlobalPrefix());
+        if (!generator)
+        {
+            error_reason = "Fail to create ORC symbol resolver: " +
+                           llvm::toString(generator.takeError());
+            return false;
+        }
+        jit_engine->getMainJITDylib().addGenerator(std::move(*generator));
+
+        auto llvm_context = std::make_unique<llvm::LLVMContext>();
+        std::unique_ptr<llvm::Module> module;
+        if (!llvm_context)
+        {
+            error_reason = "Fail to allocate LLVM context for JIT source";
+            return false;
+        }
+        if (!Build_Module_From_Source(source, *llvm_context, module))
+        {
+            return false;
+        }
+
+        module->setDataLayout(jit_engine->getDataLayout());
+        if (module->getTargetTriple().str().empty())
+        {
+            module->setTargetTriple(
+                llvm::Triple(llvm::sys::getDefaultTargetTriple()));
+        }
+
+        if (auto err = jit_engine->addIRModule(llvm::orc::ThreadSafeModule(
+                std::move(module), std::move(llvm_context))))
+        {
+            error_reason = "Fail to add LLVM IR module into ORC JIT: " +
+                           llvm::toString(std::move(err));
+            return false;
+        }
+
+        auto symbol = jit_engine->lookup(func_name);
+        if (!symbol)
+        {
+            error_reason = "Fail to lookup JIT symbol " + func_name + ": " +
+                           llvm::toString(symbol.takeError());
+            return false;
+        }
+        function = symbol->toPtr<void (*)(void**)>();
+        if (function == nullptr)
+        {
+            error_reason =
+                "Resolved JIT symbol " + func_name + " has null address";
+            return false;
+        }
+        return true;
+    }
 
    public:
     std::string error_reason;
     void Compile(std::string source)
     {
+        error_reason.clear();
+        function = nullptr;
+        jit_engine.reset();
+
         size_t pos1 = source.find("extern");
         size_t pos2 =
             source.find(string_format("%q%C%q%", {{"q", {'"'}}}), pos1);
@@ -181,191 +672,10 @@ struct JIT_Function
                                "]));";
             source.insert(pos2, stmt);
         }
-        int fd = -1;
-#ifdef _WIN32
-        char temp_dir[MAX_PATH] = {0};
-        char temp_name[MAX_PATH] = {0};
-        if (GetTempPathA(MAX_PATH, temp_dir) == 0 ||
-            GetTempFileNameA(temp_dir, "SPJ", 0, temp_name) == 0)
+        if (!Compile_With_ORC(source, func_name))
         {
-            error_reason = "Fail to create a temporary file";
             return;
         }
-        temp_string = temp_name;
-        fd = _open(temp_string.c_str(), _O_RDWR | _O_BINARY | _O_TRUNC);
-#else
-        char temp_name[CHAR_LENGTH_MAX] = "/tmp/SPONGE_jittemp_XXXXXX";
-        fd = mkstemp(temp_name);
-#endif
-        if (fd < 0)
-        {
-            error_reason = "Fail to create a temporary file";
-            return;
-        }
-#ifdef _WIN32
-        if (_write(fd, source.c_str(),
-                   static_cast<unsigned int>(source.size())) !=
-            static_cast<int>(source.size()))
-#else
-        if (write(fd, source.c_str(), source.size()) != source.size())
-#endif
-        {
-            error_reason = "Fail to write the source to the temporary file";
-            return;
-        }
-#ifdef _WIN32
-        _close(fd);
-#else
-        temp_string = temp_name;
-#endif
-        auto quote_path = [](const fs::path& path)
-        {
-            std::string value = path.string();
-            if (value.find_first_of(" \t\"'") != std::string::npos)
-            {
-                value = "\"" + value + "\"";
-            }
-            return value;
-        };
-
-        // 1) 读取 compile_commands.json，复用主程序的编译选项
-        const fs::path bin_path = Get_SPONGE_Directory();
-        const fs::path bin_dir = bin_path.parent_path();
-        fs::path project_root = bin_dir.parent_path();
-        fs::path cmake_cm_file;
-        std::vector<fs::path> cmake_cm_candidates = {
-            bin_dir / "compile_commands.json",
-            project_root / "build" / "compile_commands.json",
-            project_root / "build-cpu" / "compile_commands.json",
-            project_root / "build-debug" / "compile_commands.json",
-            project_root / "build-asan" / "compile_commands.json",
-            project_root / "build-ubsan" / "compile_commands.json"};
-        for (const auto& candidate : cmake_cm_candidates)
-        {
-            if (fs::exists(candidate))
-            {
-                cmake_cm_file = candidate;
-                break;
-            }
-        }
-        if (cmake_cm_file.empty())
-        {
-            error_reason = "找不到 compile_commands.json。尝试路径: ";
-            for (size_t i = 0; i < cmake_cm_candidates.size(); i++)
-            {
-                if (i != 0) error_reason += ", ";
-                error_reason += cmake_cm_candidates[i].string();
-            }
-            return;
-        }
-        std::ifstream f_cm(cmake_cm_file);
-        if (!f_cm.is_open())
-        {
-            error_reason = "无法读取 compile_commands.json: ";
-            error_reason += cmake_cm_file.string();
-            return;
-        }
-        std::string line;
-        std::string configure;
-        while (std::getline(f_cm, line))
-        {
-            auto pos = line.find("\"command\":");
-            if (pos == std::string::npos) continue;
-            pos = line.find('"', pos + 9);
-            if (pos == std::string::npos) continue;
-            pos += 1;
-            auto end = line.find("-o", pos);
-            if (end == std::string::npos) continue;
-            configure = line.substr(pos, end - pos);
-            break;
-        }
-        f_cm.close();
-        if (configure.empty())
-        {
-            error_reason = "无法从 compile_commands.json 中解析编译命令";
-            return;
-        }
-        while (!configure.empty() &&
-               (configure.back() == '\n' || configure.back() == '\r'))
-        {
-            configure.pop_back();
-        }
-
-        // 2) 定位 common.h 所在目录，补充 -I 参数
-        fs::path include_dir;
-        std::vector<fs::path> include_candidates = {
-            project_root / "SPONGE", project_root, bin_path.parent_path()};
-        for (const auto& candidate : include_candidates)
-        {
-            if (!candidate.empty() && fs::exists(candidate / "common.h"))
-            {
-                include_dir = candidate;
-                break;
-            }
-        }
-        if (include_dir.empty())
-        {
-            error_reason = "无法定位 common.h，项目根目录: ";
-            error_reason += project_root.string();
-            return;
-        }
-
-        configure += " -fvisibility=default -fPIC -shared -o " + temp_string +
-                     ".so -x c++ " + temp_string + " -I" +
-                     quote_path(include_dir) + " > " + temp_string +
-                     ".log 2>&1";
-        if (system(configure.c_str()))
-        {
-            error_reason = "Fail to compile the source file: \n";
-            error_reason += configure;
-            return;
-        }
-#ifdef _WIN32
-        if (_unlink(temp_string.c_str()) != 0)
-#else
-        if (unlink(temp_string.c_str()) != 0)
-#endif
-        {
-            error_reason = "Fail to unlink the temporary file: ";
-            error_reason += temp_string;
-            return;
-        }
-#ifdef _WIN32
-        std::string lib_name = temp_string + ".dll";
-        HMODULE handle = dlopen(lib_name.c_str(), 0);
-        if (handle == NULL)
-        {
-            error_reason =
-                "Fail to load dynamic library, win32 error code: " +
-                std::to_string(static_cast<unsigned long>(GetLastError()));
-            return;
-        }
-        function = reinterpret_cast<void (*)(void**)>(
-            dlsym(handle, func_name.c_str()));
-        if (function == NULL)
-        {
-            error_reason =
-                "Fail to find symbol, win32 error code: " +
-                std::to_string(static_cast<unsigned long>(GetLastError()));
-            return;
-        }
-#else
-        std::string lib_name = temp_string + ".so";
-        dlerror();
-        HMODULE handle = dlopen(lib_name.c_str(), RTLD_NOW);
-        if (const char* err = dlerror())
-        {
-            error_reason = err;
-            return;
-        }
-        dlerror();
-        function = (void (*)(void**))dlsym(handle, func_name.c_str());
-        if (const char* err = dlerror())
-        {
-            error_reason = err;
-            return;
-        }
-#endif
     }
 
     void operator()(dim3 blocks, dim3 threads, deviceStream_t stream,
@@ -378,14 +688,23 @@ struct JIT_Function
         {
             temp.push_back(const_cast<void*>(ptr));
         }
-        function(&temp[0]);
+        if (function == nullptr)
+        {
+            error_reason = "JIT function pointer is null";
+            return;
+        }
+        function(temp.data());
     }
 
-    // 重构以直接读入 std::vector<void*>
     void operator()(dim3 blocks, dim3 threads, deviceStream_t stream,
                     unsigned int shared_memory_size, std::vector<void*> args)
     {
-        function(&args[0]);
+        if (function == nullptr)
+        {
+            error_reason = "JIT function pointer is null";
+            return;
+        }
+        function(args.data());
     }
 };
 #endif
