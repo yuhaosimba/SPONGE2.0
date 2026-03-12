@@ -15,6 +15,22 @@
     (controller.Command_Choice("thermostat", (name)) || \
      controller.Command_Choice("thermostat_mode", (name)))
 
+namespace
+{
+bool Main_Is_Orthogonal_Box(const LTMatrix3& cell)
+{
+    return fabsf(cell.a21) < 1e-6f && fabsf(cell.a31) < 1e-6f &&
+           fabsf(cell.a32) < 1e-6f;
+}
+
+int Main_Projected_PP_MPI_Size(int projected_pm_mpi_size)
+{
+    const int pp_size = CONTROLLER::MPI_size - projected_pm_mpi_size -
+                        CONTROLLER::CC_MPI_size;
+    return pp_size <= 0 ? 1 : pp_size;
+}
+}  // namespace
+
 CONTROLLER controller;
 MD_INFORMATION md_info;
 DOMAIN_INFORMATION dd;
@@ -30,6 +46,7 @@ LENNARD_JONES_INFORMATION lj;
 LJ_SOFT_CORE lj_soft;
 SOLVENT_LENNARD_JONES solvent_lj;
 Particle_Mesh pm;
+FGM_DOUBLE_LAYER fgm;
 ANGLE angle;
 UREY_BRADLEY urey_bradley;
 BOND bond;
@@ -347,6 +364,71 @@ void Main_Initial(int argc, char* argv[])
         solvent_lj.Initial(&controller, &lj, &lj_soft, &md_info,
                            md_info.mode >= md_info.NVT);
     }
+
+    if (FGM_DOUBLE_LAYER::Is_Enabled_In_Controller(&controller))
+    {
+        const int projected_pm_mpi_size = pm.PM_MPI_size;
+        const int projected_pp_mpi_size =
+            Main_Projected_PP_MPI_Size(projected_pm_mpi_size);
+
+        if (!md_info.pbc.pbc)
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer requires PBC.\n");
+        }
+        if (md_info.mode == md_info.NPT)
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer does not support NPT mode.\n");
+        }
+        if (projected_pp_mpi_size > 1 || projected_pm_mpi_size > 1)
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer only supports a single PP/PM "
+                "process in phase 1.\n");
+        }
+        if (!Main_Is_Orthogonal_Box(md_info.pbc.cell))
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer only supports orthogonal boxes "
+                "in phase 1.\n");
+        }
+        if (lj_soft.is_initialized)
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer is incompatible with "
+                "LJ_soft_core in phase 1.\n");
+        }
+        if (sits.is_initialized && sits.selectively_applied)
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer is incompatible with selective "
+                "SITS in phase 1.\n");
+        }
+        if (solvent_lj.solvent_numbers > 0)
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Main_Initial",
+                "Reason:\n\tFGM_Double_Layer is incompatible with solvent_LJ "
+                "special handling in phase 1.\n");
+        }
+#ifdef USE_CPU
+        controller.Throw_SPONGE_Error(
+            spongeErrorNotImplemented, "Main_Initial",
+            "Reason:\n\tFGM_Double_Layer is not supported on the CPU backend "
+            "in phase 1.\n");
+#endif
+        fgm.Initial(&controller, md_info.atom_numbers, md_info.pbc.cell,
+                    md_info.pbc.rcell, md_info.sys.box_length,
+                    md_info.nb.cutoff);
+    }
+
     Main_Process_Management();
     if (CONTROLLER::PP_MPI_size > 1)
     {
@@ -453,6 +535,7 @@ void Main_Initial(int argc, char* argv[])
 void Main_Calculate_Force()
 {
     bool use_reaxff_eeq = reaxff_eeq.is_initialized;
+    const bool use_fgm = fgm.is_initialized;
     md_info.MD_Reset_Atom_Energy_And_Virial_And_Force();
     qc.Solve_SCF(dd.crd, md_info.sys.box_length);
     if (md_info.mode == md_info.MINIMIZATION && md_info.min.dynamic_dt)
@@ -569,7 +652,7 @@ void Main_Calculate_Force()
                                      dd.frc, dd.d_energy);
         // NOPBC END
 
-        if (!use_reaxff_eeq)
+        if (!use_reaxff_eeq && !use_fgm)
         {
             pm.MPI_PME_Excluded_Force_With_Atom_Energy(
                 dd.atom_numbers, dd.atom_local, dd.atom_local_id, dd.crd,
@@ -629,11 +712,15 @@ void Main_Calculate_Force()
                 dd.d_energy, md_info.need_pressure, dd.d_virial,
                 pm.d_direct_atom_energy);
         }
-        solvent_lj.LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
-            dd.atom_numbers, dd.res_numbers, dd.res_start, dd.crd, dd.d_charge,
-            dd.frc, md_info.pbc.cell, md_info.pbc.rcell, neighbor_list.d_nl,
-            pm.beta, md_info.need_potential, dd.d_energy, md_info.need_pressure,
-            dd.d_virial, pm.d_direct_atom_energy);
+        if (!use_fgm)
+        {
+            solvent_lj.LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
+                dd.atom_numbers, dd.res_numbers, dd.res_start, dd.crd,
+                dd.d_charge, dd.frc, md_info.pbc.cell, md_info.pbc.rcell,
+                neighbor_list.d_nl, pm.beta, md_info.need_potential,
+                dd.d_energy, md_info.need_pressure, dd.d_virial,
+                pm.d_direct_atom_energy);
+        }
 
         lj.Long_Range_Correction(
             md_info.need_pressure, dd.d_virial, md_info.need_potential,
@@ -673,6 +760,11 @@ void Main_Calculate_Force()
             md_info.nb.cutoff, pm.beta, dd.d_charge, dd.frc,
             md_info.need_potential, dd.d_energy, md_info.need_pressure,
             dd.d_virial, pm.d_direct_atom_energy);
+        if (use_fgm)
+        {
+            fgm.Compute_Green_Force_And_Energy(dd.crd, dd.d_charge, dd.frc,
+                                               dd.d_energy);
+        }
         angle.Angle_Force_With_Atom_Energy_And_Virial(
             dd.crd, md_info.pbc.cell, md_info.pbc.rcell, dd.frc,
             md_info.need_potential, dd.d_energy, md_info.need_pressure,
@@ -720,7 +812,7 @@ void Main_Calculate_Force()
         {
             vatom.Coordinate_Refresh_CV(dd.crd, md_info.pbc.cell,
                                         md_info.pbc.rcell);
-            if (!use_reaxff_eeq)
+            if (!use_reaxff_eeq && !use_fgm)
             {
                 pm.PME_Reciprocal_Force_With_Energy_And_Virial(
                     dd.crd, md_info.pbc.cell, md_info.pbc.rcell, dd.d_charge,
@@ -753,7 +845,7 @@ void Main_Calculate_Force()
         }
         else
         {
-            if (!use_reaxff_eeq)
+            if (!use_reaxff_eeq && !use_fgm)
             {
                 pm.Send_Recv_Force(&controller, md_info.frc, dd.frc,
                                    dd.atom_numbers);
@@ -768,7 +860,7 @@ void Main_Calculate_Force()
     }
     else
     {
-        if (!use_reaxff_eeq)
+        if (!use_reaxff_eeq && !use_fgm)
         {
             pm.reset_global_force(
                 md_info.no_direct_interaction_virtual_atom_numbers);
@@ -1042,7 +1134,14 @@ void Main_Print()
         {
             lj.Step_Print(&controller);
             lj_soft.Step_Print(&controller);
-            pm.Step_Print(&controller);
+            if (fgm.is_initialized)
+            {
+                fgm.Step_Print(&controller);
+            }
+            else
+            {
+                pm.Step_Print(&controller);
+            }
             sits.Step_Print(&controller, 1.0f / md_info.sys.target_temperature /
                                              CONSTANT_kB);
         }
@@ -1163,6 +1262,7 @@ void Main_Clear()
 {
     dd.Destroy_Stream();
     pm.Destroy_Stream();
+    fgm.Clear();
     deviceStreamDestroy(main_stream);
 
     controller.Final_Time_Summary(
@@ -1174,6 +1274,10 @@ void Main_Clear()
 
 float Main_Box_Change(LTMatrix3 g, int scale_box, int scale_crd, int scale_vel)
 {
+    if (scale_box && fgm.is_initialized)
+    {
+        fgm.Update_Box(md_info.pbc.cell, md_info.pbc.rcell, g, md_info.dt);
+    }
     if (scale_box)
     {
         md_info.pbc.Update_Box(g);
