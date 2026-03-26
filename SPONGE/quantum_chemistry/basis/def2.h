@@ -1,0 +1,7 @@
+﻿#pragma once
+#include "prototype.h"
+
+extern QC_BASIS_SET* QC_BASIS_DEF2_SVP_PTR;
+extern QC_BASIS_SET* QC_BASIS_DEF2_TZVP_PTR;
+extern QC_BASIS_SET* QC_BASIS_DEF2_TZVPP_PTR;
+extern QC_BASIS_SET* QC_BASIS_DEF2_QZVP_PTR;

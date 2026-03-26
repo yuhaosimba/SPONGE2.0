@@ -12,13 +12,13 @@ static __global__ void QC_Combine_SCF_Energy_Kernel(
     d_total_e[0] = e;
 }
 
-static __global__ void QC_Update_Convergence_Flag_Kernel(const int iter,
-                                                         const double tol,
-                                                         const double* d_curr_e,
-                                                         double* d_prev_e,
-                                                         int* d_converged)
+static __global__ void QC_Update_Convergence_Flag_Kernel(
+    const int iter, const double tol, const double* d_curr_e, double* d_prev_e,
+    double* d_delta_e, int* d_converged)
 {
-    if (iter > 0 && fabs(d_curr_e[0] - d_prev_e[0]) < tol)
+    const double delta_e = (iter > 0) ? (d_curr_e[0] - d_prev_e[0]) : 0.0;
+    d_delta_e[0] = delta_e;
+    if (iter > 0 && fabs(delta_e) < tol)
     {
         d_converged[0] = 1;
     }
@@ -27,43 +27,39 @@ static __global__ void QC_Update_Convergence_Flag_Kernel(const int iter,
 
 void QUANTUM_CHEMISTRY::Accumulate_SCF_Energy(int iter)
 {
-    const int energy_threads = 256;
-    const int energy_blocks = (mol.nao2 + energy_threads - 1) / energy_threads;
+    deviceMemset(scf_ws.runtime.d_e, 0, sizeof(double));
+    QC_Elec_Energy_Accumulate(mol.nao2, scf_ws.alpha.d_P, scf_ws.core.d_H_core,
+                              scf_ws.alpha.d_F, scf_ws.runtime.d_e);
 
-    deviceMemset(scf_ws.d_e, 0, sizeof(double));
-    Launch_Device_Kernel(QC_Elec_Energy_Accumulate_Kernel, energy_blocks,
-                         energy_threads, 0, 0, mol.nao2, scf_ws.d_P,
-                         scf_ws.d_H_core, scf_ws.d_F, scf_ws.d_e);
-
-    if (scf_ws.unrestricted)
+    if (scf_ws.runtime.unrestricted)
     {
-        deviceMemset(scf_ws.d_e_b, 0, sizeof(double));
-        Launch_Device_Kernel(QC_Elec_Energy_Accumulate_Kernel, energy_blocks,
-                             energy_threads, 0, 0, mol.nao2, scf_ws.d_P_b,
-                             scf_ws.d_H_core, scf_ws.d_F_b, scf_ws.d_e_b);
+        deviceMemset(scf_ws.runtime.d_e_b, 0, sizeof(double));
+        QC_Elec_Energy_Accumulate(mol.nao2, scf_ws.beta.d_P,
+                                  scf_ws.core.d_H_core, scf_ws.beta.d_F,
+                                  scf_ws.runtime.d_e_b);
     }
 
-    deviceMemset(scf_ws.d_pvxc, 0, sizeof(double));
+    deviceMemset(scf_ws.runtime.d_pvxc, 0, sizeof(double));
     if (dft.enable_dft)
     {
-        Launch_Device_Kernel(QC_Mat_Dot_Accumulate_Kernel, energy_blocks,
-                             energy_threads, 0, 0, mol.nao2, scf_ws.d_P,
-                             dft.d_Vxc, scf_ws.d_pvxc);
-        if (scf_ws.unrestricted)
+        QC_Mat_Dot_Accumulate(mol.nao2, scf_ws.alpha.d_P, dft.d_Vxc,
+                              scf_ws.runtime.d_pvxc);
+        if (scf_ws.runtime.unrestricted)
         {
-            Launch_Device_Kernel(QC_Mat_Dot_Accumulate_Kernel, energy_blocks,
-                                 energy_threads, 0, 0, mol.nao2, scf_ws.d_P_b,
-                                 dft.d_Vxc_beta, scf_ws.d_pvxc);
+            QC_Mat_Dot_Accumulate(mol.nao2, scf_ws.beta.d_P, dft.d_Vxc_beta,
+                                  scf_ws.runtime.d_pvxc);
         }
     }
 
-    Launch_Device_Kernel(
-        QC_Combine_SCF_Energy_Kernel, 1, 1, 0, 0, dft.enable_dft, scf_ws.d_e,
-        scf_ws.unrestricted ? scf_ws.d_e_b : (const double*)nullptr,
-        scf_ws.d_nuc_energy_dev, dft.d_exc_total, scf_ws.d_pvxc,
-        scf_ws.d_scf_energy);
+    Launch_Device_Kernel(QC_Combine_SCF_Energy_Kernel, 1, 1, 0, 0,
+                         dft.enable_dft, scf_ws.runtime.d_e,
+                         scf_ws.runtime.unrestricted ? scf_ws.runtime.d_e_b
+                                                     : (const double*)nullptr,
+                         scf_ws.core.d_nuc_energy_dev, dft.d_exc_total,
+                         scf_ws.runtime.d_pvxc, scf_ws.core.d_scf_energy);
 
     Launch_Device_Kernel(QC_Update_Convergence_Flag_Kernel, 1, 1, 0, 0, iter,
-                         scf_ws.energy_tol, scf_ws.d_scf_energy,
-                         scf_ws.d_prev_energy, scf_ws.d_converged);
+                         scf_ws.runtime.energy_tol, scf_ws.core.d_scf_energy,
+                         scf_ws.runtime.d_prev_energy, scf_ws.runtime.d_delta_e,
+                         scf_ws.runtime.d_converged);
 }

@@ -13,7 +13,6 @@ struct QC_GRID_POINT
 
 static inline float QC_Get_Covalent_Radius_Bohr(int Z)
 {
-    // Covalent radii in Angstrom for H-Ar, fallback to 1.0 A.
     static const float rad_ang[19] = {1.00f,  // dummy
                                       0.31f, 0.28f, 1.28f, 0.96f, 0.84f, 0.76f,
                                       0.71f, 0.66f, 0.57f, 0.58f, 1.66f, 1.41f,

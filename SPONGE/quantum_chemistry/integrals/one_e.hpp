@@ -1,5 +1,8 @@
 ﻿#pragma once
 
+#include "../../common.h"
+#include "../quantum_chemistry.h"
+
 static const int QC_COMP_LX_HOST[35] = {0, 1, 0, 0, 2, 1, 1, 0, 0, 0, 3, 2,
                                         2, 1, 1, 1, 0, 0, 0, 0, 4, 3, 3, 2,
                                         2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0};
@@ -68,8 +71,8 @@ __forceinline__ static void QC_Get_Lxyz_Host(int l, int idx, int& lx, int& ly,
     lz = QC_COMP_LZ_HOST[offset + idx];
 }
 
-__device__ void get_overlap1d_arr(int l1, int l2, float PA, float PB,
-                                  float gamma, float res[6][6])
+static __device__ void get_overlap1d_arr(int l1, int l2, float PA, float PB,
+                                         float gamma, float res[6][6])
 {
     res[0][0] = sqrtf(CONSTANT_Pi / gamma);
     for (int i = 0; i <= l1; i++)
@@ -94,16 +97,17 @@ __device__ void get_overlap1d_arr(int l1, int l2, float PA, float PB,
     }
 }
 
-__device__ float get_overlap1d_val(int l1, int l2, float PA, float PB,
-                                   float gamma)
+static __device__ float get_overlap1d_val(int l1, int l2, float PA, float PB,
+                                          float gamma)
 {
     float res[6][6];
     get_overlap1d_arr(l1, l2, PA, PB, gamma, res);
     return res[l1][l2];
 }
 
-__device__ float get_kin1d(int l1, int l2, float PA, float PB, float gamma,
-                           float alpha, float beta, float res[6][6])
+static __device__ float get_kin1d(int l1, int l2, float PA, float PB,
+                                  float gamma, float alpha, float beta,
+                                  float res[6][6])
 {
     get_overlap1d_arr(l1 + 1, l2 + 1, PA, PB, gamma, res);
     float t = 2.0f * alpha * beta * res[l1 + 1][l2 + 1];
@@ -114,12 +118,13 @@ __device__ float get_kin1d(int l1, int l2, float PA, float PB, float gamma,
     return t;
 }
 
-__device__ void compute_boys(float* F, float t, int max_m)
+static __device__ void compute_boys(float* F, float t, int max_m)
 {
     float exp_t = expf(-t);
     if (t < 1e-7f)
     {
         for (int m = 0; m <= max_m; m++) F[m] = 1.0f / (2.0f * m + 1.0f);
+        return;
     }
     else
     {
@@ -136,8 +141,86 @@ __device__ void compute_boys(float* F, float t, int max_m)
     }
 }
 
-__device__ void compute_md_coeffs(float E[5][5][9], int la_max, int lb_max,
-                                  float PA, float PB, float one_over_2p)
+// Double-precision Boys function. Uses downward recursion for t ≤ 30,
+// upward in double for t > 30. Output stays double for R-tensor seeding.
+static __device__ void compute_boys_double(double* F, float t, int max_m)
+{
+    const double td = (double)t;
+    if (td < 1e-15)
+    {
+        for (int m = 0; m <= max_m; m++) F[m] = 1.0 / (2.0 * m + 1.0);
+        return;
+    }
+    const double exp_t = exp(-td);
+    const double st = sqrt(td);
+    const double f0 = 0.5 * 1.7724538509055159 * erf(st) / st;
+    if (td <= 30.0)
+    {
+        double work[64];
+        const int m_top = max_m + 25;
+        work[m_top] = 0.0;
+        for (int m = m_top - 1; m >= 0; m--)
+            work[m] = (2.0 * td * work[m + 1] + exp_t) / (2.0 * m + 1.0);
+        const double scale = f0 / work[0];
+        for (int m = 0; m <= max_m; m++) F[m] = work[m] * scale;
+    }
+    else
+    {
+        F[0] = f0;
+        double prev = f0;
+        for (int m = 0; m < max_m; m++)
+        {
+            double next = ((2.0 * m + 1.0) * prev - exp_t) / (2.0 * td);
+            F[m + 1] = next;
+            prev = next;
+        }
+    }
+}
+
+static __device__ void compute_boys_stable(float* F, float t, int max_m)
+{
+    if (t < 1e-8f)
+    {
+        for (int m = 0; m <= max_m; m++) F[m] = 1.0f / (2.0f * m + 1.0f);
+        return;
+    }
+
+    const double td = (double)t;
+    const double exp_t = exp(-td);
+    const double st = sqrt(td);
+    const double f0_exact =
+        0.5 * sqrt((double)CONSTANT_Pi) * erf(st) / fmax(st, 1e-30);
+
+    // Upward recursion is numerically fragile for small/moderate t at high m.
+    // Use Miller downward recursion in that regime and normalize by the exact
+    // F0 value; keep the cheaper upward recursion only for large t.
+    if (t <= 20.0f)
+    {
+        double work[64];
+        const int m_top = max_m + 20;
+        work[m_top] = 1.0;
+        for (int m = m_top - 1; m >= 0; m--)
+        {
+            work[m] = (2.0 * td * work[m + 1] + exp_t) / (2.0 * m + 1.0);
+        }
+        const double scale = f0_exact / work[0];
+        for (int m = 0; m <= max_m; m++) F[m] = (float)(work[m] * scale);
+        return;
+    }
+
+    F[0] = (float)f0_exact;
+    double prev_f = f0_exact;
+    for (int m = 0; m < max_m; m++)
+    {
+        double next_f = ((2.0 * m + 1.0) * prev_f - exp_t) / (2.0 * td);
+        F[m + 1] = (float)next_f;
+        prev_f = next_f;
+    }
+}
+
+static __device__ void compute_md_coeffs(float E[5][5][9], int la_max,
+                                         int lb_max, float PA, float PB,
+                                         float one_over_2p)
 {
     for (int i = 0; i < 5; i++)
         for (int j = 0; j < 5; j++)
@@ -176,8 +259,8 @@ __device__ void compute_md_coeffs(float E[5][5][9], int la_max, int lb_max,
     }
 }
 
-__device__ void compute_r_tensor_1e(float* R, float* F, float alpha,
-                                    float PC[3], int L_tot)
+static __device__ void compute_r_tensor_1e(float* R, double* F, float alpha,
+                                           float PC[3], int L_tot)
 {
     int total_size = ONEE_MD_BASE * ONEE_MD_BASE * ONEE_MD_BASE * ONEE_MD_BASE;
     for (int i = 0; i < total_size; i++) R[i] = 0.0f;
@@ -315,10 +398,10 @@ static __global__ void OneE_Kernel(
                                         (Pz - Cz) * (Pz - Cz);
                             float PC[3] = {Px - Cx, Py - Cy, Pz - Cz};
                             int L_tot = li + lj;
-                            float F_vals[ONEE_MD_BASE];
+                            double F_vals[ONEE_MD_BASE];
                             float R_vals[ONEE_MD_BASE * ONEE_MD_BASE *
                                          ONEE_MD_BASE * ONEE_MD_BASE];
-                            compute_boys(F_vals, g * PC2, L_tot);
+                            compute_boys_double(F_vals, g * PC2, L_tot);
                             compute_r_tensor_1e(R_vals, F_vals, g, PC, L_tot);
 
                             double v_sum = 0.0;

@@ -1,83 +1,123 @@
 ﻿#pragma once
 
-static __global__ void QC_Build_Fock_Kernel(
-    const int nao, const float* H_core, const float* P_coul, const float* P_exx,
-    const float* ERI, const float exx_scale, const float* Vxc,
-    const int use_vxc, float* F)
-{
-    SIMPLE_DEVICE_FOR(idx, nao * nao)
-    {
-        int i = idx / nao;
-        int j = idx - i * nao;
-        double fij = (double)H_core[i * nao + j];
-        for (int k = 0; k < nao; k++)
-        {
-            for (int l = 0; l < nao; l++)
-            {
-                int id1 = ((int)i * nao * nao * nao) + (int)j * nao * nao +
-                          k * nao + l;
-                int id2 = ((int)i * nao * nao * nao) + (int)k * nao * nao +
-                          j * nao + l;
-                fij += (double)P_coul[k * nao + l] * (double)ERI[id1] -
-                       (double)exx_scale * (double)P_exx[k * nao + l] *
-                           (double)ERI[id2];
-            }
-        }
-        if (use_vxc) fij += (double)Vxc[i * nao + j];
-        F[i * nao + j] = (float)fij;
-    }
-}
+#include "../integrals/eri/common/direct_fock_kernels.hpp"
+#include "../integrals/eri/cpu/task_filter.hpp"
+#include "../integrals/eri/eri_backend.hpp"
 
-void QUANTUM_CHEMISTRY::Build_Fock()
+void QUANTUM_CHEMISTRY::Build_Fock(int iter)
 {
     const int threads = 256;
     const int total = mol.nao2;
 
-    if (dft.enable_dft)
+    if (dft.enable_dft) Build_DFT_VXC();
+
+    Launch_Device_Kernel(QC_Init_Fock_Kernel, (total + threads - 1) / threads,
+                         threads, 0, 0, total, scf_ws.core.d_H_core, dft.d_Vxc,
+                         dft.enable_dft, scf_ws.alpha.d_F);
+    if (scf_ws.runtime.unrestricted)
     {
-        if (scf_ws.unrestricted)
-        {
-            QC_Build_DFT_VXC_UKS(
-                blas_handle, method, mol.is_spherical, mol.nao_cart, mol.nao,
-                dft.max_grid_size, dft.grid_batch_size, mol.nbas,
-                dft.d_grid_coords, dft.d_grid_weights, cart2sph.d_cart2sph_mat,
-                mol.d_centers, mol.d_l_list, mol.d_exps, mol.d_coeffs,
-                mol.d_shell_offsets, mol.d_shell_sizes, mol.d_ao_offsets,
-                scf_ws.d_norms, scf_ws.d_P, scf_ws.d_P_b, dft.d_ao_vals_cart,
-                dft.d_ao_grad_x_cart, dft.d_ao_grad_y_cart,
-                dft.d_ao_grad_z_cart, dft.d_ao_vals, dft.d_ao_grad_x,
-                dft.d_ao_grad_y, dft.d_ao_grad_z, dft.d_exc_total, dft.d_Vxc,
-                dft.d_Vxc_beta);
-        }
-        else
-        {
-            QC_Build_DFT_VXC(
-                blas_handle, method, mol.is_spherical, mol.nao_cart, mol.nao,
-                dft.max_grid_size, dft.grid_batch_size, mol.nbas,
-                dft.d_grid_coords, dft.d_grid_weights, cart2sph.d_cart2sph_mat,
-                mol.d_centers, mol.d_l_list, mol.d_exps, mol.d_coeffs,
-                mol.d_shell_offsets, mol.d_shell_sizes, mol.d_ao_offsets,
-                scf_ws.d_norms, scf_ws.d_P, dft.d_ao_vals_cart,
-                dft.d_ao_grad_x_cart, dft.d_ao_grad_y_cart,
-                dft.d_ao_grad_z_cart, dft.d_ao_vals, dft.d_ao_grad_x,
-                dft.d_ao_grad_y, dft.d_ao_grad_z, dft.d_rho, dft.d_sigma,
-                dft.d_exc, dft.d_vrho, dft.d_vsigma, dft.d_exc_total,
-                dft.d_Vxc);
-        }
+        Launch_Device_Kernel(QC_Init_Fock_Kernel,
+                             (total + threads - 1) / threads, threads, 0, 0,
+                             total, scf_ws.core.d_H_core, dft.d_Vxc_beta,
+                             dft.enable_dft, scf_ws.beta.d_F);
     }
+
+#ifndef USE_GPU
+    if (scf_ws.alpha.d_F_double)
+        for (int i = 0; i < total; i++)
+            scf_ws.alpha.d_F_double[i] = (double)scf_ws.alpha.d_F[i];
+    if (scf_ws.beta.d_F_double && scf_ws.runtime.unrestricted)
+        for (int i = 0; i < total; i++)
+            scf_ws.beta.d_F_double[i] = (double)scf_ws.beta.d_F[i];
+#endif
+
+#ifdef USE_GPU
+    float* d_F_build = scf_ws.alpha.d_F;
+    float* d_F_b_build =
+        scf_ws.runtime.unrestricted ? scf_ws.beta.d_F : (float*)nullptr;
+#else
+    const int thread_total = scf_ws.direct.fock_thread_count * total;
+    deviceMemset(scf_ws.direct.d_F_thread, 0, sizeof(double) * thread_total);
+    if (scf_ws.runtime.unrestricted)
+        deviceMemset(scf_ws.direct.d_F_b_thread, 0,
+                     sizeof(double) * thread_total);
+    double* d_F_build = scf_ws.direct.d_F_thread;
+    double* d_F_b_build = scf_ws.runtime.unrestricted
+                              ? scf_ws.direct.d_F_b_thread
+                              : (double*)nullptr;
+#endif
 
     Launch_Device_Kernel(
-        QC_Build_Fock_Kernel, (total + threads - 1) / threads, threads, 0, 0,
-        mol.nao, scf_ws.d_H_core, scf_ws.d_P_coul, scf_ws.d_P, scf_ws.d_ERI,
-        scf_ws.unrestricted ? dft.exx_fraction : (0.5f * dft.exx_fraction),
-        dft.d_Vxc, dft.enable_dft, scf_ws.d_F);
+        QC_Build_Shell_Pair_Density_Kernel,
+        (task_ctx.topo.n_shell_pairs + threads - 1) / threads, threads, 0, 0,
+        task_ctx.topo.n_shell_pairs, task_ctx.buffers.d_shell_pairs,
+        mol.d_ao_offsets, mol.d_ao_offsets_sph, mol.d_l_list, mol.is_spherical,
+        mol.nao, scf_ws.direct.d_P_coul, scf_ws.direct.d_pair_density_coul,
+        scf_ws.alpha.d_P, scf_ws.direct.d_pair_density_exx,
+        scf_ws.runtime.unrestricted ? scf_ws.beta.d_P : (const float*)nullptr,
+        scf_ws.direct.d_pair_density_exx_b);
 
-    if (scf_ws.unrestricted)
+    const float exx_scale_a = scf_ws.runtime.unrestricted
+                                  ? dft.exx_fraction
+                                  : (0.5f * dft.exx_fraction);
+    const float exx_scale_b =
+        scf_ws.runtime.unrestricted ? dft.exx_fraction : 0.0f;
+    const float shell_screen_tol = QC_Effective_Shell_Screen_Tol(
+        task_ctx.params.eri_shell_screen_tol, iter);
+    const float prim_screen_tol = QC_Effective_Prim_Screen_Tol(
+        task_ctx.params.direct_eri_prim_screen_tol, iter);
+
+#ifdef USE_GPU
+    QC_Build_Fock_Direct_GPU(
+        task_ctx, mol.d_atm, mol.d_bas, mol.d_env, mol.d_ao_offsets,
+        mol.d_ao_offsets_sph, scf_ws.ortho.d_norms,
+        task_ctx.buffers.d_shell_pair_bounds, scf_ws.direct.d_pair_density_coul,
+        scf_ws.direct.d_pair_density_exx,
+        scf_ws.runtime.unrestricted ? scf_ws.direct.d_pair_density_exx_b
+                                    : (const float*)nullptr,
+        shell_screen_tol, scf_ws.direct.d_P_coul, scf_ws.alpha.d_P,
+        scf_ws.runtime.unrestricted ? scf_ws.beta.d_P : (const float*)nullptr,
+        exx_scale_a, exx_scale_b, mol.nao, mol.nao_sph, mol.is_spherical,
+        cart2sph.d_cart2sph_mat, d_F_build, d_F_b_build,
+        scf_ws.direct.d_hr_pool, prim_screen_tol);
+
+    if (scf_ws.alpha.d_F_double != NULL)
+        QC_Float_To_Double_Copy(total, scf_ws.alpha.d_F,
+                                scf_ws.alpha.d_F_double);
+    if (scf_ws.runtime.unrestricted && scf_ws.beta.d_F_double != NULL)
+        QC_Float_To_Double_Copy(total, scf_ws.beta.d_F, scf_ws.beta.d_F_double);
+#else
+    QC_Build_Fock_Direct_CPU(
+        task_ctx, mol.nbas, mol.d_atm, mol.d_bas, mol.d_env, mol.d_ao_offsets,
+        mol.d_ao_offsets_sph, scf_ws.ortho.d_norms,
+        task_ctx.buffers.d_shell_pair_bounds, scf_ws.direct.d_pair_density_coul,
+        scf_ws.direct.d_pair_density_exx,
+        scf_ws.runtime.unrestricted ? scf_ws.direct.d_pair_density_exx_b
+                                    : (const float*)nullptr,
+        shell_screen_tol, scf_ws.direct.d_P_coul, scf_ws.alpha.d_P,
+        scf_ws.runtime.unrestricted ? scf_ws.beta.d_P : (const float*)nullptr,
+        exx_scale_a, exx_scale_b, mol.nao, mol.nao_sph, mol.is_spherical,
+        cart2sph.d_cart2sph_mat, d_F_build, d_F_b_build,
+        scf_ws.direct.d_hr_pool,
+        (QC_Angular_Term_CPU*)scf_ws.direct.h_cpu_bra_terms,
+        (QC_Angular_Term_CPU*)scf_ws.direct.h_cpu_ket_terms,
+        task_ctx.params.eri_hr_base, task_ctx.params.eri_hr_size,
+        task_ctx.params.eri_shell_buf_size, prim_screen_tol,
+        scf_ws.direct.fock_thread_count);
+#endif
+
+#ifndef USE_GPU
+    Launch_Device_Kernel(
+        QC_Reduce_Thread_Fock_Kernel, (total + threads - 1) / threads, threads,
+        0, 0, total, scf_ws.direct.fock_thread_count, scf_ws.direct.d_F_thread,
+        scf_ws.alpha.d_F, scf_ws.alpha.d_F_double);
+    if (scf_ws.runtime.unrestricted)
     {
-        Launch_Device_Kernel(QC_Build_Fock_Kernel,
+        Launch_Device_Kernel(QC_Reduce_Thread_Fock_Kernel,
                              (total + threads - 1) / threads, threads, 0, 0,
-                             mol.nao, scf_ws.d_H_core, scf_ws.d_P_coul,
-                             scf_ws.d_P_b, scf_ws.d_ERI, dft.exx_fraction,
-                             dft.d_Vxc_beta, dft.enable_dft, scf_ws.d_F_b);
+                             total, scf_ws.direct.fock_thread_count,
+                             scf_ws.direct.d_F_b_thread, scf_ws.beta.d_F,
+                             scf_ws.beta.d_F_double);
     }
+#endif
 }

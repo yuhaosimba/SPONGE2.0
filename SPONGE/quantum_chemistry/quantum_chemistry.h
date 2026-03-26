@@ -6,9 +6,22 @@
 #include "structure/cart2sph.h"
 #include "structure/dft.h"
 #include "structure/integral_tasks.h"
+#include "structure/matrix.h"
 #include "structure/method.h"
 #include "structure/molecule.h"
 #include "structure/scf_workspace.h"
+
+#define ONE_E_BATCH_SIZE 4096
+#define PI_25 17.4934183276248628469f
+#define HR_BASE_MAX 17
+#define HR_SIZE_MAX 83521
+#define ONEE_MD_BASE 9
+#define ONEE_MD_IDX(t, u, v, n) \
+    ((((t) * ONEE_MD_BASE + (u)) * ONEE_MD_BASE + (v)) * ONEE_MD_BASE + (n))
+#define ERI_BATCH_SIZE 128
+#define MAX_CART_SHELL 15
+#define MAX_SHELL_ERI \
+    (MAX_CART_SHELL * MAX_CART_SHELL * MAX_CART_SHELL * MAX_CART_SHELL)
 
 struct QUANTUM_CHEMISTRY
 {
@@ -19,6 +32,7 @@ struct QUANTUM_CHEMISTRY
     int atom_numbers = 0;
 
     float scf_energy = 0.0f;
+    FILE* scf_output_file = NULL;
 
     // 本地原子映射
     std::vector<int> atom_local;
@@ -38,17 +52,14 @@ struct QUANTUM_CHEMISTRY
     BLAS_HANDLE blas_handle;
     SOLVER_HANDLE solver_handle;
 
-    // device pointers for 2e integrals
-    float* d_hr_pool = NULL;  // Keep float to save memory
-
-    // Cartesian->spherical transform buffers/workspaces
+    // 笛卡尔基组转球形基组
     QC_CARTESIAN_TO_SPHERICAL cart2sph;
 
-    // 外部入口（main.cpp）
+    // 外部入口
     void Initial(CONTROLLER* controller, const int atom_numbers,
                  const VECTOR* crd, const char* module_name = NULL);
     void Solve_SCF(const VECTOR* crd, const VECTOR box_length,
-                   bool need_energy = true);
+                   bool need_energy = true, int md_step = -1);
 
     // 外部查询与输出
     void Step_Print(CONTROLLER* controller);
@@ -67,9 +78,6 @@ struct QUANTUM_CHEMISTRY
     // 积分与基组变换内部流程
     void Build_Cart2Sph_Matrix();
     void Cart2Sph_OneE_Integrals();
-    void Cart2Sph_ERI();
-
-    void Update_DFT_Grid();
 
     // 坐标更新
     void Update_Coordinates_From_MD(const VECTOR* crd, const VECTOR box_length);
@@ -79,12 +87,16 @@ struct QUANTUM_CHEMISTRY
     void Compute_Nuclear_Repulsion(const VECTOR box_length);
     void Prepare_Integrals();
 
+    // DFT VXC 构建
+    void Update_DFT_Grid();
+    void Build_DFT_VXC();
+
     // SCF 循环内部流程
-    void Build_Fock();
+    void Build_Fock(int iter);
     void Accumulate_SCF_Energy(int iter);
     void Apply_DIIS(int iter);
     void Diagonalize_And_Build_Density();
-    bool Mix_And_Check_Convergence(int iter);
+    bool Mix_And_Check_Convergence(int iter, int md_step);
     void Build_Overlap_X();
     void Reset_SCF_State();
 };

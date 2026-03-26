@@ -82,6 +82,10 @@ struct QC_MOLECULE
     std::vector<int> h_ao_offsets;
     int* d_ao_offsets = NULL;
 
+    // 每个壳层的原子轨道起始偏移（球谐/有效 AO）
+    std::vector<int> h_ao_offsets_sph;
+    int* d_ao_offsets_sph = NULL;
+
     // 原子轨道累计偏移表（笛卡尔）
     std::vector<int> h_ao_loc;
     int* d_ao_loc = NULL;

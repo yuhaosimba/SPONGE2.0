@@ -155,6 +155,13 @@ enum deviceEigMode_t
                 (transa == DEVICE_BLAS_OP_N ? CblasNoTrans : CblasTrans),    \
                 (transb == DEVICE_BLAS_OP_N ? CblasNoTrans : CblasTrans), m, \
                 n, k, *(alpha), A, lda, B, ldb, *(beta), C, ldc)
+
+#define deviceBlasDgemm(handle, transa, transb, m, n, k, alpha, A, lda, B,   \
+                        ldb, beta, C, ldc)                                   \
+    cblas_dgemm(CblasColMajor,                                               \
+                (transa == DEVICE_BLAS_OP_N ? CblasNoTrans : CblasTrans),    \
+                (transb == DEVICE_BLAS_OP_N ? CblasNoTrans : CblasTrans), m, \
+                n, k, *(alpha), A, lda, B, ldb, *(beta), C, ldc)
 #endif
 
 #endif  // BLAS_BACKEND_H
@@ -175,5 +182,33 @@ enum deviceEigMode_t
 
 #define deviceSolverCreate(handle)
 #define deviceSolverDestroy(handle)
+
+#define deviceSolverDsyevdBufferSize(handle, jobz, uplo, n, A, lda, W, lwork) \
+    [&]() -> int                                                              \
+    {                                                                         \
+        double wq;                                                            \
+        lapack_int iwq;                                                       \
+        LAPACKE_dsyevd_work(LAPACK_COL_MAJOR, 'V', 'U', (lapack_int)(n), (A), \
+                            (lapack_int)(lda), (W), &wq, -1, &iwq, -1);       \
+        *(lwork) = (int)(wq + 0.5);                                           \
+        return 0;                                                             \
+    }()
+
+#define deviceSolverDsyevd(handle, jobz, uplo, n, A, lda, W, work, lwork,     \
+                           info)                                              \
+    do                                                                        \
+    {                                                                         \
+        lapack_int _liw = 0;                                                  \
+        double _wq;                                                           \
+        lapack_int _iwq;                                                      \
+        LAPACKE_dsyevd_work(LAPACK_COL_MAJOR, 'V', 'U', (lapack_int)(n), (A), \
+                            (lapack_int)(lda), (W), &_wq, -1, &_iwq, -1);     \
+        _liw = _iwq;                                                          \
+        std::vector<lapack_int> _iwork(_liw);                                 \
+        *(info) = (int)LAPACKE_dsyevd_work(                                   \
+            LAPACK_COL_MAJOR, 'V', 'U', (lapack_int)(n), (A),                 \
+            (lapack_int)(lda), (W), (work), (lapack_int)(lwork),              \
+            _iwork.data(), (lapack_int)_liw);                                 \
+    } while (0)
 
 #endif  // SOLVER_BACKEND_H
