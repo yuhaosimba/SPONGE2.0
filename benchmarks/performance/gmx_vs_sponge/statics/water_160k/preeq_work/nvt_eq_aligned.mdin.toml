@@ -1,0 +1,27 @@
+md_name = "water_160k_nvt_preeq_aligned"
+mode = "nvt"
+step_limit = 20000
+dt = 0.002
+cutoff = 10.0
+amber_parm7 = "../water.prmtop"
+amber_rst7 = "../water_start_aligned_novel.rst7"
+rst = "../water_nvt_eq"
+constrain_mode = "SETTLE"
+
+target_temperature = 300.0
+thermostat = "middle_langevin"
+thermostat_tau = 1.0
+thermostat_seed = 2026
+
+write_information_interval = 10000
+write_mdout_interval = 10000
+write_trajectory_interval = 0
+write_restart_file_interval = 20000
+print_zeroth_frame = 0
+
+[neighbor_list]
+refresh_interval = 50
+
+[PME]
+grid_spacing = 1.0
+update_interval = 1

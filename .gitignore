@@ -30,3 +30,6 @@ outputs/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+
+# Generated pre-equilibration outputs for the water_160k benchmark.
+benchmarks/performance/gmx_vs_sponge/statics/water_160k/preeq_work/gmx/

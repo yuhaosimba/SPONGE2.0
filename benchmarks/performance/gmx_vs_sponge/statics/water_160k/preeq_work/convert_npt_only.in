@@ -1,0 +1,5 @@
+parm water.prmtop
+trajin water_npt_eq.gro
+trajout water_npt_eq.rst7 restart novelocity
+run
+quit

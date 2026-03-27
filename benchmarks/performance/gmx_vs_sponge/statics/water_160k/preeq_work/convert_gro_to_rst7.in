@@ -1,0 +1,5 @@
+parm water.prmtop
+trajin water.gro
+trajout water_start_aligned.rst7 restart
+run
+quit

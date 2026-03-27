@@ -1,0 +1,34 @@
+md_name = "water_160k_npt_preeq_aligned_stable"
+mode = "npt"
+step_limit = 5000
+dt = 0.001
+cutoff = 10.0
+amber_parm7 = "../water.prmtop"
+amber_rst7 = "../water_nvt_eq.rst7"
+rst = "../water_npt_eq"
+constrain_mode = "SETTLE"
+
+target_temperature = 300.0
+thermostat = "middle_langevin"
+thermostat_tau = 1.0
+thermostat_seed = 2026
+
+target_pressure = 1.0
+barostat = "berendsen_barostat"
+barostat_tau = 5.0
+barostat_update_interval = 10
+barostat_isotropy = "isotropic"
+barostat_compressibility = 4.5e-5
+
+write_information_interval = 1000
+write_mdout_interval = 1000
+write_trajectory_interval = 0
+write_restart_file_interval = 5000
+print_zeroth_frame = 0
+
+[neighbor_list]
+refresh_interval = 50
+
+[PME]
+grid_spacing = 1.0
+update_interval = 1
