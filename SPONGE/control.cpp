@@ -36,6 +36,24 @@ D_MPI_Comm CONTROLLER::D_MPI_COMM_WORLD;
 D_MPI_Comm CONTROLLER::d_pp_comm;
 D_MPI_Comm CONTROLLER::d_pm_comm;
 
+static bool Parse_Bool_String(const std::string& raw_value, bool* parsed)
+{
+    std::string value = raw_value;
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on")
+    {
+        parsed[0] = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off")
+    {
+        parsed[0] = false;
+        return true;
+    }
+    return false;
+}
+
 bool CONTROLLER::Command_Exist(const char* key)
 {
     const char* temp = strstr(key, "in_file");
@@ -568,6 +586,32 @@ void CONTROLLER::Default_Set()
         Check_Int("buffer_frame", "CONTROLLER::Default_Set");
         buffer_frame = atoi(Command("buffer_frame"));
     }
+    strict_timer_sync = false;
+    const char* strict_timer_sync_env = std::getenv("SPONGE_STRICT_TIMER_SYNC");
+    if (strict_timer_sync_env != NULL)
+    {
+        bool parsed = false;
+        if (Parse_Bool_String(strict_timer_sync_env, &strict_timer_sync))
+        {
+            parsed = true;
+        }
+        if (!parsed)
+        {
+            Throw_Formatted_SPONGE_Error(
+                spongeErrorTypeErrorCommand, "CONTROLLER::Default_Set",
+                "Reason:\n\tunable to parse environment variable "
+                "'SPONGE_STRICT_TIMER_SYNC' as bool, got '%s'\n",
+                strict_timer_sync_env);
+        }
+    }
+    if (Command_Exist("strict_timer_sync"))
+    {
+        strict_timer_sync =
+            Get_Bool("strict_timer_sync", "CONTROLLER::Default_Set");
+    }
+    TIME_RECORDER::Set_Strict_Sync(strict_timer_sync);
+    printf("    strict_timer_sync is %s\n",
+           strict_timer_sync ? "enabled" : "disabled");
 }
 
 // 初始化设备
@@ -938,6 +982,9 @@ void CONTROLLER::Final_Time_Summary(int steps, float time_factor,
 {
 #ifdef USE_MPI
     MPI_Barrier(MPI_COMM_WORLD);
+#endif
+#ifdef GPU_ARCH_NAME
+    hostDeviceSynchronize();
 #endif
     core_time.Stop();
     float print_time_unit_factor = 1.0f;

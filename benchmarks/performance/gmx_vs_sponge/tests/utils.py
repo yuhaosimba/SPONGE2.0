@@ -39,7 +39,12 @@ class BenchConfig:
     log_interval: int
     nstlist: int
     cutoff_angstrom: float
+    skin_angstrom: float
     pme_grid_spacing_angstrom: float
+    pme_fftx: int | None
+    pme_ffty: int | None
+    pme_fftz: int | None
+    gmx_disable_pme_tuning: bool
     coordinate_tolerance_angstrom: float
     box_tolerance_angstrom: float
     seed: int
@@ -49,6 +54,10 @@ class BenchConfig:
     @property
     def rcut_nm(self) -> float:
         return self.cutoff_angstrom / 10.0
+
+    @property
+    def rlist_nm(self) -> float:
+        return (self.cutoff_angstrom + self.skin_angstrom) / 10.0
 
 
 class CommandError(RuntimeError):
@@ -63,6 +72,10 @@ def build_gromacs_mdp(
     log_interval: int,
     nstlist: int,
     rcut_nm: float,
+    rlist_nm: float,
+    pme_fftx: int | None,
+    pme_ffty: int | None,
+    pme_fftz: int | None,
     target_temperature: float,
     target_pressure: float,
     seed: int,
@@ -88,13 +101,25 @@ def build_gromacs_mdp(
         "; ===== NEIGHBOR SEARCHING =====",
         "cutoff-scheme   = Verlet",
         f"nstlist         = {int(nstlist)}",
-        f"rlist           = {float(rcut_nm):.4f}",
+        f"rlist           = {float(rlist_nm):.4f}",
+        "verlet-buffer-tolerance = -1",
         "",
         "; ===== ELECTROSTATICS =====",
         "coulombtype     = PME",
         f"rcoulomb        = {float(rcut_nm):.4f}",
         "pme_order       = 4",
-        "fourierspacing  = 0.10",
+    ]
+    if pme_fftx is not None and pme_ffty is not None and pme_fftz is not None:
+        lines += [
+            f"fourier_nx      = {int(pme_fftx)}",
+            f"fourier_ny      = {int(pme_ffty)}",
+            f"fourier_nz      = {int(pme_fftz)}",
+        ]
+    else:
+        lines += [
+            "fourierspacing  = 0.10",
+        ]
+    lines += [
         "",
         "; ===== VAN DER WAALS =====",
         "vdwtype         = cutoff",
@@ -153,6 +178,11 @@ def build_sponge_mdin(
     log_interval: int,
     refresh_interval: int,
     cutoff_angstrom: float,
+    skin_angstrom: float,
+    pme_grid_spacing_angstrom: float,
+    pme_fftx: int | None,
+    pme_ffty: int | None,
+    pme_fftz: int | None,
     target_temperature: float,
     target_pressure: float,
     seed: int,
@@ -169,6 +199,7 @@ def build_sponge_mdin(
         f"step_limit = {int(steps)}",
         f"dt = {float(dt_ps):.6f}",
         f"cutoff = {float(cutoff_angstrom):.4f}",
+        f"skin = {float(skin_angstrom):.4f}",
         'constrain_mode = "SETTLE"',
         f"target_temperature = {float(target_temperature):.4f}",
         'thermostat = "middle_langevin"',
@@ -202,10 +233,19 @@ def build_sponge_mdin(
             f"refresh_interval = {int(refresh_interval)}",
             "",
             "[PME]",
-            "grid_spacing = 1.0",
-            "update_interval = 1",
         ]
     )
+    if pme_fftx is not None and pme_ffty is not None and pme_fftz is not None:
+        lines.extend(
+            [
+                f"fftx = {int(pme_fftx)}",
+                f"ffty = {int(pme_ffty)}",
+                f"fftz = {int(pme_fftz)}",
+            ]
+        )
+    else:
+        lines.append(f"grid_spacing = {float(pme_grid_spacing_angstrom):.4f}")
+    lines.append("update_interval = 1")
 
     return "\n".join(lines) + "\n"
 
@@ -393,6 +433,11 @@ def run_sponge_once(
         log_interval=cfg.log_interval,
         refresh_interval=cfg.nstlist,
         cutoff_angstrom=cfg.cutoff_angstrom,
+        skin_angstrom=cfg.skin_angstrom,
+        pme_grid_spacing_angstrom=cfg.pme_grid_spacing_angstrom,
+        pme_fftx=cfg.pme_fftx,
+        pme_ffty=cfg.pme_ffty,
+        pme_fftz=cfg.pme_fftz,
         target_temperature=cfg.temperature_k,
         target_pressure=cfg.pressure_bar,
         seed=cfg.seed,
@@ -434,6 +479,10 @@ def run_gromacs_once(
         log_interval=cfg.log_interval,
         nstlist=cfg.nstlist,
         rcut_nm=cfg.rcut_nm,
+        rlist_nm=cfg.rlist_nm,
+        pme_fftx=cfg.pme_fftx,
+        pme_ffty=cfg.pme_ffty,
+        pme_fftz=cfg.pme_fftz,
         target_temperature=cfg.temperature_k,
         target_pressure=cfg.pressure_bar,
         seed=cfg.seed,
@@ -476,6 +525,8 @@ def run_gromacs_once(
         "on",
         "-noconfout",
     ]
+    if cfg.gmx_disable_pme_tuning:
+        mdrun_base += ["-notunepme"]
 
     gpu_mode = True
     start = time.perf_counter()
@@ -680,6 +731,22 @@ def config_from_sources(
                 return str(parent.resolve())
         return str(local.resolve())
 
+    def _parse_optional_int(key: str) -> int | None:
+        raw = env.get(key)
+        if raw is None or raw == "":
+            return None
+        return int(raw)
+
+    def _parse_bool(key: str, default: bool) -> bool:
+        raw = env.get(key)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    pme_fftx = _parse_optional_int("BENCH_PME_FFTX")
+    pme_ffty = _parse_optional_int("BENCH_PME_FFTY")
+    pme_fftz = _parse_optional_int("BENCH_PME_FFTZ")
+
     cfg = BenchConfig(
         case_dir=resolved_case_dir,
         warmup=int(warmup if warmup is not None else env.get("BENCH_WARMUP", 3)),
@@ -704,7 +771,12 @@ def config_from_sources(
         log_interval=int(env.get("BENCH_LOG_INTERVAL", 10000)),
         nstlist=int(env.get("BENCH_NSTLIST", 50)),
         cutoff_angstrom=float(env.get("BENCH_CUTOFF_ANGSTROM", 10.0)),
+        skin_angstrom=float(env.get("BENCH_SKIN_ANGSTROM", 2.0)),
         pme_grid_spacing_angstrom=float(env.get("BENCH_PME_GRID_ANGSTROM", 1.0)),
+        pme_fftx=pme_fftx,
+        pme_ffty=pme_ffty,
+        pme_fftz=pme_fftz,
+        gmx_disable_pme_tuning=_parse_bool("BENCH_GMX_DISABLE_PME_TUNING", True),
         coordinate_tolerance_angstrom=float(env.get("BENCH_COORD_TOL_ANGSTROM", 0.02)),
         box_tolerance_angstrom=float(env.get("BENCH_BOX_TOL_ANGSTROM", 0.05)),
         seed=int(env.get("BENCH_SEED", 2026)),
@@ -724,6 +796,19 @@ def config_from_sources(
     ]:
         if value <= 0:
             raise ValueError(f"{key} must be positive")
+
+    pme_dims = [cfg.pme_fftx, cfg.pme_ffty, cfg.pme_fftz]
+    if any(v is not None for v in pme_dims) and any(v is None for v in pme_dims):
+        raise ValueError("BENCH_PME_FFTX/Y/Z must be all set or all unset")
+    for key, value in [
+        ("BENCH_PME_FFTX", cfg.pme_fftx),
+        ("BENCH_PME_FFTY", cfg.pme_ffty),
+        ("BENCH_PME_FFTZ", cfg.pme_fftz),
+    ]:
+        if value is not None and value <= 0:
+            raise ValueError(f"{key} must be positive")
+    if cfg.skin_angstrom < 0:
+        raise ValueError("BENCH_SKIN_ANGSTROM must be >= 0")
 
     return cfg
 
@@ -754,10 +839,18 @@ def build_summary(
             "cutoff": {
                 "gromacs_nm": cfg.rcut_nm,
                 "sponge_angstrom": cfg.cutoff_angstrom,
+                "skin_angstrom": cfg.skin_angstrom,
+                "gromacs_rlist_nm": cfg.rlist_nm,
             },
             "pme": {
                 "gromacs_fourierspacing_nm": 0.10,
                 "sponge_grid_spacing_angstrom": cfg.pme_grid_spacing_angstrom,
+                "explicit_fft_grid": {
+                    "fftx": cfg.pme_fftx,
+                    "ffty": cfg.pme_ffty,
+                    "fftz": cfg.pme_fftz,
+                },
+                "gromacs_disable_tuning": cfg.gmx_disable_pme_tuning,
             },
             "neighbor_refresh": {
                 "gromacs_nstlist": cfg.nstlist,

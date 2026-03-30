@@ -38,12 +38,19 @@ pixi run -e dev-cuda12 bench-gmx-vs-sponge
 - `BENCH_GPU_ID` (default: `0`)
 - `BENCH_GMX_NTMPI` (default: `1`)
 - `BENCH_GMX_NTOMP` (default: `8`)
+- `BENCH_GMX_BIN` (default: `gmx`)
 - `BENCH_SPONGE_PARM7_FILE` (default: auto-detect `water.prmtop`)
 - `BENCH_SPONGE_RST7_FILE_NVT` (default: `water_nvt_eq.rst7`)
 - `BENCH_SPONGE_RST7_FILE_NPT` (default: `water_npt_eq.rst7`)
 - `BENCH_TOP_FILE` (default: `water.top`)
 - `BENCH_GRO_FILE_NVT` (default: `water_nvt_eq.gro`)
 - `BENCH_GRO_FILE_NPT` (default: `water_npt_eq.gro`)
+- `BENCH_CUTOFF_ANGSTROM` (default: `10.0`)
+- `BENCH_SKIN_ANGSTROM` (default: `2.0`)
+- `BENCH_NSTLIST` (default: `50`)
+- `BENCH_PME_GRID_ANGSTROM` (default: `1.0`, used when FFT grid is not explicitly set)
+- `BENCH_PME_FFTX`, `BENCH_PME_FFTY`, `BENCH_PME_FFTZ` (default: unset; when all 3 are set, both engines use explicit identical FFT grid)
+- `BENCH_GMX_DISABLE_PME_TUNING` (default: `1`; adds `-notunepme` for strict PME-grid comparability)
 
 ## Outputs
 

@@ -29,6 +29,7 @@
 | `step_limit` | int | `1000` | Total simulation steps |
 | `dt` | float | `0.001` | Time step (ps) |
 | `frame_limit` | int | - | Frame limit for rerun mode |
+| `strict_timer_sync` | bool | `false` | If `true`, force device-wide sync at timer start/stop for strict timing diagnostics (slower) |
 
 ## Force Cutoff
 

@@ -47,6 +47,7 @@ struct CONTROLLER
 
     // 文件输出缓冲大小
     int buffer_frame;
+    bool strict_timer_sync = false;
     // 设置文件缓冲区大小
     void Set_File_Buffer(FILE* file, size_t one_frame_size);
 
