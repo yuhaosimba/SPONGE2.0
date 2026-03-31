@@ -188,6 +188,19 @@ void SOLVENT_LENNARD_JONES::Initial(CONTROLLER* controller,
         controller->printf("START INITIALIZING SOLVENT LJ:\n");
         this->lj_info = lj;
         this->lj_soft_info = lj_soft;
+        launch_block_y = Sanitize_LJ_Block_Y(
+            8, min(8u, static_cast<unsigned int>(CONTROLLER::device_max_thread /
+                                                 CONTROLLER::device_warp)),
+            CONTROLLER::device_max_thread, CONTROLLER::device_warp);
+        if (controller->Command_Exist(this->module_name, "launch_block_y"))
+        {
+            controller->Check_Int(this->module_name, "launch_block_y",
+                                  "SOLVENT_LENNARD_JONES::Initial");
+            launch_block_y = Sanitize_LJ_Block_Y(
+                atoi(controller->Command(this->module_name, "launch_block_y")),
+                launch_block_y, CONTROLLER::device_max_thread,
+                CONTROLLER::device_warp);
+        }
         solvent_numbers = 0;
         solvent_start = md_info->ug.ug_numbers;
         for (int i = md_info->ug.ug_numbers - 1; i >= 0; i -= 1)
@@ -210,6 +223,8 @@ void SOLVENT_LENNARD_JONES::Initial(CONTROLLER* controller,
             }
         }
         controller->printf("    the solvent is %d-point\n", water_points);
+        controller->printf("    solvent LJ launch block y: %u\n",
+                           launch_block_y);
         controller->printf(
             "    the number of solvent atoms is %d (started from Residue "
             "#%d)\n",
@@ -264,9 +279,7 @@ void SOLVENT_LENNARD_JONES::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
 #ifdef USE_GPU
         dim3 blockSize = {
             static_cast<unsigned int>(CONTROLLER::device_warp),
-            static_cast<unsigned int>(min(
-                8u, static_cast<unsigned int>(CONTROLLER::device_max_thread /
-                                              CONTROLLER::device_warp)))};
+            launch_block_y};
         dim3 gridSize(static_cast<unsigned int>(
             (residue_numbers - solvent_start_local + blockSize.y - 1) /
             blockSize.y));

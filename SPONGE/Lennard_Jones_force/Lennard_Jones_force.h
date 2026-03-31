@@ -9,6 +9,9 @@
 __host__ __device__ __forceinline__ int Get_LJ_Type(int a, int b);
 __host__ __device__ __forceinline__ int Get_LJ_Type(unsigned int a,
                                                     unsigned int b);
+__host__ __device__ __forceinline__ unsigned int Sanitize_LJ_Block_Y(
+    int requested, unsigned int fallback, unsigned int max_thread,
+    unsigned int warp);
 
 struct VECTOR_LJ
 {
@@ -72,6 +75,18 @@ struct VECTOR_LJ
                 erfcf(beta_dr));
     }
 };
+__host__ __device__ __forceinline__ unsigned int Sanitize_LJ_Block_Y(
+    int requested, unsigned int fallback, unsigned int max_thread,
+    unsigned int warp)
+{
+    unsigned int max_y = max_thread / warp;
+    if (max_y == 0) max_y = 1;
+    if (fallback == 0 || fallback > max_y) fallback = max_y;
+    if (requested <= 0) return fallback;
+    unsigned int value = static_cast<unsigned int>(requested);
+    if (value > max_y) value = max_y;
+    return value;
+}
 __global__ void Copy_LJ_Type_To_New_Crd(const int atom_numbers,
                                         VECTOR_LJ* new_crd, const int* LJ_type);
 __global__ void Copy_Crd_And_Charge_To_New_Crd(const int atom_numbers,
@@ -122,6 +137,7 @@ struct LENNARD_JONES_INFORMATION
     void Parameter_Host_To_Device();
 
     float cutoff = 10.0;
+    unsigned int launch_block_y = 0;
     VECTOR_LJ* crd_with_LJ_parameters = NULL;
 
     /*

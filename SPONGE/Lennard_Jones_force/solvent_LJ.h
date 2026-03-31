@@ -16,6 +16,7 @@ struct SOLVENT_LENNARD_JONES
     int solvent_numbers = 0;
     int solvent_start = 0;
     int water_points = 0;
+    unsigned int launch_block_y = 0;
 
     LENNARD_JONES_INFORMATION* lj_info;
     LJ_SOFT_CORE* lj_soft_info;

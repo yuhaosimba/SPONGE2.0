@@ -1,177 +1,266 @@
-# LJ Atom-Pair Performance Optimization Plan
+# LJ atom-pair 路径性能优化计划
 
-> Scope: keep the current atom-pair neighbor-list structure (`ATOM_GROUP`) unchanged. Optimize the LJ/direct-Coulomb path as far as possible without introducing cluster-pair list semantics.
+> 范围约束：保持当前 `ATOM_GROUP` 近邻表语义不变，不引入 GROMACS 风格的 cluster-pair 邻居表。在现有 atom-pair 路径上，尽可能提升 SPONGE 的 LJ / direct-Coulomb GPU 性能。
 
-## Goal
+## 目标
 
-Improve SPONGE GPU nonbonded throughput on the current atom-pair path while preserving the existing neighbor-list interface used by other modules.
+在不改近邻表外部接口的前提下，提升 SPONGE 在 GPU 上的非键相互作用吞吐，重点优化标准 LJ / direct-Coulomb 热路径。
 
-## Boundaries
+## 边界条件
 
-- Do not change `ATOM_GROUP` semantics or the external neighbor-list API.
-- Do not convert the codebase to cluster-pair lists in this branch.
-- Allow internal kernel/data-path changes inside the LJ module.
-- Every optimization patch must be followed by benchmark measurement.
+- 不修改 `ATOM_GROUP` 的数据语义。
+- 不修改对外暴露的近邻表接口。
+- 不在本分支中引入 cluster-pair、super-cluster 或新型 pairlist 语义。
+- 允许修改 LJ 模块内部 kernel、launch 配置、局部缓存策略和写回方式。
+- 每一次性能优化改动后，都必须重新测试，不允许凭感觉判断“更快了”。
 
-## Profiling Baseline
+## 当前基线结论
 
-The current bottleneck is not register spilling. The main issues from Nsight Compute are:
+结合之前的 Nsight Systems / Nsight Compute 结果，当前 LJ 路径的主要问题不是寄存器溢出，而是以下几点：
 
-- Low SM throughput: about `15.66%`
-- Low memory throughput: about `15.59%`
-- Low achieved occupancy: about `42.09%`
-- Poor cache locality: `L2 hit ~34.80%`, `L1/TEX hit ~0%`
-- Main warp stalls: `wait`, `short_scoreboard`, `branch_resolving`, `drain`
+- `SM Throughput` 偏低，约 `15.66%`
+- `Memory Throughput` 偏低，约 `15.59%`
+- `Achieved Occupancy` 偏低，约 `42.09%`
+- cache 局部性较差：`L2 hit rate ~34.80%`，`L1/TEX hit rate ~0%`
+- warp stall 主要集中在：
+  - `wait`
+  - `short_scoreboard`
+  - `branch_resolving`
+  - `drain`
 
-Reference files:
+这意味着当前瓶颈更偏向：
 
-- General LJ kernel: `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
-- LJ math helpers: `SPONGE/Lennard_Jones_force/Lennard_Jones_force.h`
-- Water-specialized staging path: `SPONGE/Lennard_Jones_force/solvent_LJ.cpp`
-- External benchmark harness: `/home/ylj/SPONGE_GITHUB/SPG_GMX_TEST/runner.py`
+1. 线程组织不理想
+2. 随机访存较多
+3. `atomicAdd(frc[atom_j])` 写回压力较大
+4. `j` 粒子数据复用不足
 
-Important note:
+## 已验证结论
 
-- The `ncu` per-launch kernel duration is not directly comparable between SPONGE and GROMACS as a total-step cost. Use throughput, cache, occupancy, stall, and end-to-end `ns/day` as the primary evidence.
+已经做过一次尝试：将 `sqrt + powf` 改写为 `dr2 / inv_r / inv_r2 / inv_r6` 路径，并对 `water_160k` 做了前后 benchmark 对照。
 
-## Optimization Roadmap
+结果：
 
-### P0: Arithmetic Cleanup
+- 该改写没有带来可见加速
+- 在 `NVT, 20000 steps, warmup=1, repeats=1` 的 quick benchmark 上，`ns/day` 反而约下降 `0.34%`
+- 同时这类改写会降低代码可读性
 
-Target files:
+结论：
+
+- 该方向不应继续作为当前阶段的优先优化项
+- 文档后续计划中不再把“算术改写”列为主线
+
+## 重点源码位置
+
+- 标准 LJ kernel：
+  - `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
+- LJ 参数与 helper：
+  - `SPONGE/Lennard_Jones_force/Lennard_Jones_force.h`
+- 水分子 fast path：
+  - `SPONGE/Lennard_Jones_force/solvent_LJ.cpp`
+- 软核 LJ 相关：
+  - `SPONGE/Lennard_Jones_force/LJ_soft_core.h`
+- 外部 benchmark 工具：
+  - `/home/ylj/SPONGE_GITHUB/SPG_GMX_TEST/runner.py`
+
+## 优化主线
+
+### P0：Launch Configuration Sweep
+
+这是当前最应该先做的优化项。
+
+#### 目的
+
+验证当前 LJ kernel 的 block 组织是否显著限制了 occupancy、issue active 和 latency hiding。
+
+#### 原因
+
+- 当前 profiler 结果显示 `occupancy` 和 `issue active` 都不理想
+- 现有 kernel 属于明显的 memory-irregular 路径
+- 当前 launch 形状较重，可能导致每个 SM 的活跃 block 数不足
+- 这类优化不改算法语义，也不明显降低代码可读性
+
+#### 目标文件
+
+- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
+
+#### 执行内容
+
+至少测试以下 launch 配置：
+
+- `(32, 4, 1)`
+- `(32, 8, 1)`
+- `(32, 16, 1)`
+- `(64, 4, 1)`，如果当前映射逻辑允许
+
+保留规则：
+
+- 只有在 end-to-end benchmark 中有稳定收益的配置才能保留
+- 不能只看单次 `ncu`，必须看最终 `ns/day`
+
+### P1：降低 `atomicAdd(frc[atom_j])` 写回压力
+
+这是当前最可能带来实质收益的优化方向之一。
+
+#### 原因
+
+当前标准 LJ kernel 中，对 `atom_j` 的力回写采用随机原子写：
+
+- 写回位置离散
+- 可能发生较多竞争
+- 会增加 LSU 压力
+- 会拉低 warp issue 效率
+
+这与当前 `ncu` 中偏低的 memory throughput 和 issue active 是一致的。
+
+#### 目标文件
+
+- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
+- 如有必要，同步评估 `SPONGE/Lennard_Jones_force/solvent_LJ.cpp`
+
+#### 执行内容
+
+优先考虑以下方向：
+
+1. warp 内先局部累加，再做合并写回
+2. block 内对相同 `atom_j` 的贡献做局部归并
+3. 降低每对 pair 都触发一次全局原子写的频率
+
+#### 约束
+
+- 不改变力学语义
+- 不改变近邻表语义
+- 不引入新的全局数据结构依赖
+
+### P1：标准 LJ kernel 的 `j` 粒子 tile staging
+
+这是与当前 cache 问题最直接对应的优化项。
+
+#### 原因
+
+当前 general LJ kernel 中，每次 pair 计算都存在较明显的随机读取：
+
+- `atom_j`
+- `crd[atom_j]`
+- 类型信息
+- 电荷信息
+- LJ 参数表
+
+这与当前较差的 `L2` / `L1` 命中率高度一致。
+
+#### 目标文件
+
+- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
+
+参考实现：
+
+- `SPONGE/Lennard_Jones_force/solvent_LJ.cpp`
+
+#### 执行内容
+
+1. 将一批 `atom_j` 索引搬入 shared memory
+2. 将对应的 `x/y/z/q/type` 搬入 shared memory 或寄存器
+3. 在 block 内尽量复用这一 tile
+4. 在不改 neighbor-list 语义的前提下改善访存局部性
+
+#### 注意
+
+- 这里只允许改 kernel 调度与临时缓存
+- 不允许把 neighbor-list 语义改成 cluster-pair
+
+### P2：只读路径清理与 `const __restrict__`
+
+这是低风险的小优化项，适合作为补充项。
+
+#### 目标
+
+- 给编译器更明确的别名信息
+- 争取更好的只读缓存和调度结果
+
+#### 目标文件
 
 - `SPONGE/Lennard_Jones_force/Lennard_Jones_force.h`
 - `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
-- Any duplicated LJ formulas in `solvent_LJ.cpp`, `LJ_soft_core`, or SITS variants if affected
 
-Tasks:
+#### 执行内容
 
-1. Replace `sqrt + powf` heavy code with `dr2 / inv_r / inv_r2 / inv_r6` math.
-2. Switch cutoff checks from `dr < cutoff` to `dr2 < cutoff2`.
-3. Keep force/energy/virial semantics unchanged for the current template specializations.
-4. Re-test numerical stability after the rewrite.
+1. 在可确认无别名冲突的位置补充 `const __restrict__`
+2. 清理 force-only 热路径中不必要的条件判断
+3. 尽量减少热点代码中的无关分支
 
-Why first:
+### P2：热点路径专门化
 
-- This is the highest expected gain for the lowest architectural risk.
+当前最热点的是标准 `force-only + direct Coulomb` 路径。
 
-### P0: Launch Configuration Sweep
+#### 目标
 
-Target files:
+进一步减少热点中的模板分支干扰与控制流复杂度。
 
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
+#### 方向
 
-Tasks:
+- 对最常用组合做更明确的专用实现
+- 避免在热点中保留不必要的能量/virial 路径开销
 
-1. Stop assuming the current `(32, 32, 1)` launch shape is optimal.
-2. Benchmark at least:
-   - `(32, 4, 1)`
-   - `(32, 8, 1)`
-   - `(32, 16, 1)`
-   - `(64, 4, 1)` if the mapping remains valid
-3. Keep the fastest shape only after end-to-end benchmark confirmation.
+### P3：参数表访问优化
 
-Why now:
+这一项有可能带来局部收益，但当前不应先做。
 
-- The current kernel is memory-irregular. A smaller block may improve active blocks per SM and reduce latency-hiding failure.
+#### 目标
 
-### P1: Read-Only Path Cleanup
+优化 `Get_LJ_Type` 之后的 `A/B` 参数访问成本。
 
-Target files:
+#### 可选方向
 
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.h`
+1. 合并 `(A, B)` 读取
+2. 对低类型数体系尝试 constant memory
+3. 对水体系等低类型场景做轻量专门化
 
-Tasks:
+#### 说明
 
-1. Add `const __restrict__` where aliasing is impossible.
-2. Make read-only arrays eligible for better caching paths.
-3. Remove avoidable inner-loop branches in the force-only hot path.
+这类优化只有在前面的 launch / writeback / staging 都做过之后，才值得投入。
 
-Why:
+### 暂不优先的方向
 
-- Low development cost. Can help cache behavior and compiler scheduling.
+以下方向当前不作为主线：
 
-### P1: General-Kernel J-Tile Staging
+1. 再次做 `sqrt/powf` 类算术重写
+2. 直接做 AoS -> SoA 全局改造
+3. 修改近邻表结构
+4. 引入 cluster-pair 路径
 
-Target files:
+原因：
 
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
-- Use `solvent_LJ.cpp` as reference, not as a direct template copy
+- 第一项已验证收益不明显
+- 第二项工程扰动过大
+- 第三、四项超出当前分支边界
 
-Tasks:
+## 建议执行顺序
 
-1. Stage a tile of `atom_j` indices into shared memory.
-2. Stage corresponding `x/y/z/q/type` into shared memory or registers.
-3. Reuse staged data across the block before loading the next tile.
+当前推荐的执行顺序如下：
 
-Why:
+1. Launch Configuration Sweep
+2. 降低 `atomicAdd(frc[atom_j])` 压力
+3. 标准 LJ kernel 的 `j` tile staging
+4. `const __restrict__` 与只读路径清理
+5. 参数表访问优化
 
-- The current kernel performs random gathers for each pair. This is consistent with the poor L2/L1 results from `ncu`.
+## 基准测试纪律
 
-### P1: Atomic Writeback Reduction
+每次优化都必须重新测量。没有新测出来的数据，就不能声称“这次优化有效”。
 
-Target files:
-
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
-
-Tasks:
-
-1. Reduce `atomicAdd` pressure on `frc[atom_j]`.
-2. Evaluate warp-local or block-local accumulation before global flush.
-3. Keep the current physical semantics unchanged.
-
-Why:
-
-- Random atomic writeback is one of the most likely contributors to low issue rate and poor memory efficiency.
-
-### P2: Hot-Buffer Layout Split
-
-Target files:
-
-- LJ setup path and launch path
-- Potentially add an internal packed SoA-like buffer for the LJ kernel
-
-Tasks:
-
-1. Keep external API unchanged.
-2. Build a kernel-friendly hot buffer for `x/y/z/q/type`.
-3. Use that buffer only for the LJ path.
-
-Why:
-
-- `VECTOR_LJ` is AoS-oriented. The current memory pattern is not ideal for the GPU kernel.
-
-### P2: Type-Table Specialization
-
-Target files:
-
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.cpp`
-- `SPONGE/Lennard_Jones_force/Lennard_Jones_force.h`
-
-Tasks:
-
-1. Review how `Get_LJ_Type` and `LJ_type_A/B` are used in the hot loop.
-2. For low-type-count systems such as water, evaluate constant-memory or packed-parameter paths.
-3. Keep this optional unless profiling shows it is still material after P0/P1.
-
-## Benchmark Discipline
-
-Every optimization change must be measured. No patch should be considered an improvement without fresh benchmark evidence.
-
-### Environment
+### 环境
 
 ```bash
 source /home/ylj/SPONGE_GITHUB/SPG_GMX_TEST/env_gpu.sh
-export SPONGE_BIN=/home/ylj/SPONGE_GITHUB/SPONGE/build-dev-cuda12/SPONGE
+export SPONGE_BIN=/home/ylj/SPONGE_GITHUB/SPONGE/.pixi/envs/dev-cuda12/bin/SPONGE
 export GMX_BIN=/home/ylj/应用/gromacs-2026.1/install-cuda/bin/gmx
 ```
 
-If a different SPONGE binary is under test, update `SPONGE_BIN` explicitly before each run.
+如果本次测试使用的是其他构建产物，必须在运行前显式更新 `SPONGE_BIN`。
 
-### Build Step
+### 编译命令
 
-Use a fresh CUDA build before benchmarking:
+每次 benchmark 前使用当前源码重新编译 CUDA 二进制：
 
 ```bash
 cd /home/ylj/SPONGE_GITHUB/SPONGE
@@ -180,7 +269,7 @@ pixi run -e dev-cuda12 compile
 
 ### Quick Regression Benchmark
 
-Run after every meaningful LJ patch:
+用于每个 patch 后的快速回归：
 
 ```bash
 cd /home/ylj/SPONGE_GITHUB/SPG_GMX_TEST
@@ -195,7 +284,7 @@ python runner.py bench \
   --run-id lj_acc_quick_<tag>
 ```
 
-Record from `outputs/<run_id>/summary.json`:
+必须记录：
 
 - `elapsed_s`
 - `steps_per_s`
@@ -203,7 +292,7 @@ Record from `outputs/<run_id>/summary.json`:
 
 ### Acceptance Benchmark
 
-Run after each completed P0/P1 phase:
+用于每完成一个 P0 或 P1 阶段后的确认：
 
 ```bash
 cd /home/ylj/SPONGE_GITHUB/SPG_GMX_TEST
@@ -218,9 +307,9 @@ python runner.py bench \
   --run-id lj_acc_accept_<tag>
 ```
 
-### Optional Reference Comparison Against GROMACS 1 CPU
+### 可选参考对照：GROMACS 1 CPU + 1 GPU
 
-Use when checking whether SPONGE closes the kernel-level gap while preserving current fairness settings:
+当需要判断 SPONGE 是否缩小与 GROMACS 单 CPU 配置的差距时，运行：
 
 ```bash
 cd /home/ylj/SPONGE_GITHUB/SPG_GMX_TEST
@@ -237,69 +326,57 @@ python runner.py bench \
   --run-id lj_acc_vs_gmx1_<tag>
 ```
 
-## Profiler Checkpoints
+## Profiler 使用规则
 
-Use profiler checkpoints only after a patch changes the kernel behavior materially.
+只有当某次 patch 明显改变了 kernel 行为时，才重新做 profiler。
 
 ### Nsight Systems
 
-Purpose:
+用途：
 
-- Confirm that kernel launch cadence and end-to-end GPU pipeline do not regress
+- 观察 kernel 发射节奏是否退化
+- 观察 GPU pipeline 是否被新的同步或空洞破坏
 
 ### Nsight Compute
 
-Purpose:
+重点关注以下指标是否改善：
 
-- Check whether a patch improves:
-  - SM throughput
-  - memory throughput
-  - achieved occupancy
-  - L2 hit rate
-  - stall breakdown
+- `SM Throughput`
+- `Memory Throughput`
+- `Achieved Occupancy`
+- `L2 hit rate`
+- stall breakdown
 
-Minimum comparison set:
+### profiler 结论规则
 
-- current branch result
-- previous baseline result
+- 不允许仅根据单次 kernel 时间判断优化有效
+- 必须结合 end-to-end benchmark 判断
 
-## Required Evidence Per Patch
+## 每个 patch 必须记录的证据
 
-For each LJ optimization patch, record:
+每次 LJ 优化 patch 完成后，至少记录以下内容：
 
-1. Git commit hash
-2. Patch scope
-3. Quick regression benchmark `ns/day`
-4. Delta vs previous baseline
-5. Whether numerical output stayed acceptable
-6. Whether profiler evidence was collected
+1. git commit hash
+2. 改动范围
+3. quick benchmark 的 `ns/day`
+4. 与上一个基线相比的百分比变化
+5. 数值行为是否仍可接受
+6. 是否补充了 profiler 证据
 
-Recommended log format:
+推荐记录格式：
 
 ```markdown
-| Commit | Scope | Steps | ns/day | Delta | Notes |
-|--------|-------|-------|--------|-------|-------|
-| abc123 | arithmetic rewrite | 20000 | 78.4 | +12.1% | NVT quick regression |
+| Commit | 改动内容 | Steps | ns/day | 相对变化 | 备注 |
+|--------|----------|-------|--------|----------|------|
+| abc123 | launch sweep: 32x8 | 20000 | 78.4 | +6.2% | quick benchmark |
 ```
 
-## Execution Order
+## 成功标准
 
-Recommended order for this branch:
+本分支只有在满足以下条件时，才算技术上成功：
 
-1. Arithmetic cleanup
-2. Launch-shape sweep
-3. Read-only path cleanup
-4. J-tile staging
-5. Atomic writeback reduction
-6. Optional hot-buffer layout split
-7. Optional type-table specialization
-
-## Exit Criteria
-
-The branch is considered technically successful only if:
-
-1. SPONGE `ns/day` improves on the same NVT case and same fairness settings
-2. Numerical behavior remains acceptable
-3. No neighbor-list API changes are introduced
-4. Benchmark evidence is stored for each phase
+1. 在相同公平参数下，SPONGE 的 `ns/day` 有稳定提升
+2. 没有引入新的近邻表语义
+3. 数值行为保持可接受
+4. 每个阶段都有可复查的 benchmark 证据
 

@@ -235,6 +235,17 @@ void LENNARD_JONES_INFORMATION::Initial(CONTROLLER* controller, float cutoff,
     if (is_initialized)
     {
         this->cutoff = cutoff;
+        launch_block_y = CONTROLLER::device_max_thread / CONTROLLER::device_warp;
+        if (controller->Command_Exist(this->module_name, "launch_block_y"))
+        {
+            controller->Check_Int(this->module_name, "launch_block_y",
+                                  "LENNARD_JONES_INFORMATION::Initial");
+            launch_block_y = Sanitize_LJ_Block_Y(
+                atoi(controller->Command(this->module_name, "launch_block_y")),
+                launch_block_y, CONTROLLER::device_max_thread,
+                CONTROLLER::device_warp);
+        }
+        controller->printf("    LJ launch block y: %u\n", launch_block_y);
         Device_Malloc_Safely((void**)&crd_with_LJ_parameters,
                              sizeof(VECTOR_LJ) * atom_numbers);
         Launch_Device_Kernel(
@@ -255,7 +266,7 @@ void LENNARD_JONES_INFORMATION::Initial(CONTROLLER* controller, float cutoff,
                          1};
         dim3 blockSize = {
             CONTROLLER::device_warp,
-            CONTROLLER::device_max_thread / CONTROLLER::device_warp};
+            launch_block_y};
         Launch_Device_Kernel(Total_C6_Get, gridSize, blockSize, 0, NULL,
                              atom_numbers, d_atom_LJ_type, d_LJ_B,
                              d_long_range_factor);
