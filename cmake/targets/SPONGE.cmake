@@ -80,7 +80,9 @@ set(SPONGE_SOURCES
     ${PROJECT_ROOT_DIR}/SPONGE/manybody/reaxff/over_under.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/manybody/reaxff/valence_angle.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/manybody/reaxff/torsion.cpp
-    ${PROJECT_ROOT_DIR}/SPONGE/manybody/reaxff/hydrogen_bond.cpp)
+    ${PROJECT_ROOT_DIR}/SPONGE/manybody/reaxff/hydrogen_bond.cpp
+    ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp
+    ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp)
 
 set(SOURCES ${SPONGE_SOURCES})
 
@@ -100,3 +102,12 @@ target_link_libraries(sponge_toml PUBLIC tomlplusplus::tomlplusplus)
 add_executable(${CURRENT_TARGET} ${SOURCES})
 target_link_libraries(${CURRENT_TARGET} PRIVATE sponge_toml)
 install(TARGETS ${CURRENT_TARGET} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(
+  nbnxm_frozen_bench
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/frozen_port/nbnxm_frozen_bench.cu
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/frozen_port/ljewald_kernel_frozen_port.cu
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_frozen_bench PRIVATE sponge_toml)
+install(TARGETS nbnxm_frozen_bench RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
