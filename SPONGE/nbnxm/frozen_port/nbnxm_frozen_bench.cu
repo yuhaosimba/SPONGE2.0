@@ -1,4 +1,10 @@
 #include "../nbnxm_fixture.h"
+#include "../nbnxm_compare.h"
+#include "../nbnxm_exclusions.h"
+#include "../nbnxm_force_dump.h"
+#include "../nbnxm_live_builder_input.h"
+#include "../nbnxm_stage.h"
+#include "../nbnxm_builder.h"
 #include "ljewald_kernel_frozen_port.h"
 
 #include <algorithm>
@@ -27,11 +33,16 @@ namespace
 struct CliOptions
 {
     std::filesystem::path fixturePath;
+    std::filesystem::path gridDumpPath;
+    std::filesystem::path exclusionsDumpPath;
+    std::filesystem::path pairlistDumpPath;
+    std::filesystem::path referenceForceDumpPath;
     int iterations = 50;
     int warmup = 10;
     int repeats = 3;
     float thresholdPct = 5.0F;
-    std::string mode = "compare";
+    std::string mode = "pairlist+kernel";
+    std::string pairlistSource = "fixture";
     std::filesystem::path gromacsBenchBin = "/home/ylj/应用/gromacs-2026.1/build-cuda/bin/nbnxm-ljewald-bench";
 };
 
@@ -105,6 +116,14 @@ CliOptions parseCli(int argc, char** argv)
         {
             opt.iterations = std::atoi(argv[++i]);
         }
+        else if (arg == "--grid-dump" && i + 1 < argc)
+        {
+            opt.gridDumpPath = argv[++i];
+        }
+        else if (arg == "--exclusions-dump" && i + 1 < argc)
+        {
+            opt.exclusionsDumpPath = argv[++i];
+        }
         else if (arg == "--warmup" && i + 1 < argc)
         {
             opt.warmup = std::atoi(argv[++i]);
@@ -117,6 +136,18 @@ CliOptions parseCli(int argc, char** argv)
         {
             opt.mode = argv[++i];
         }
+        else if (arg == "--pairlist-source" && i + 1 < argc)
+        {
+            opt.pairlistSource = argv[++i];
+        }
+        else if (arg == "--pairlist-dump" && i + 1 < argc)
+        {
+            opt.pairlistDumpPath = argv[++i];
+        }
+        else if (arg == "--reference-force-dump" && i + 1 < argc)
+        {
+            opt.referenceForceDumpPath = argv[++i];
+        }
         else if (arg == "--threshold-pct" && i + 1 < argc)
         {
             opt.thresholdPct = std::atof(argv[++i]);
@@ -127,16 +158,24 @@ CliOptions parseCli(int argc, char** argv)
         }
         else
         {
-            throw std::runtime_error("Usage: nbnxm_frozen_bench --fixture <path> [--iters N] [--warmup N] [--repeats N] [--mode sponge|compare] [--gromacs-bench-bin <path>] [--threshold-pct P]");
+            throw std::runtime_error("Usage: nbnxm_frozen_bench --fixture <path> [--pairlist-source fixture|live] [--grid-dump <path>] [--exclusions-dump <path>] [--pairlist-dump <path>] [--reference-force-dump <path>] [--iters N] [--warmup N] [--repeats N] [--mode pairlist-only|pairlist+kernel|compare] [--gromacs-bench-bin <path>] [--threshold-pct P]");
         }
     }
     if (opt.fixturePath.empty())
     {
         throw std::runtime_error("missing --fixture");
     }
-    if (opt.mode != "sponge" && opt.mode != "compare")
+    if (opt.mode != "pairlist-only" && opt.mode != "pairlist+kernel" && opt.mode != "compare")
     {
-        throw std::runtime_error("--mode must be sponge or compare");
+        throw std::runtime_error("--mode must be pairlist-only, pairlist+kernel or compare");
+    }
+    if (opt.pairlistSource != "fixture" && opt.pairlistSource != "live")
+    {
+        throw std::runtime_error("--pairlist-source must be fixture or live");
+    }
+    if (opt.pairlistSource == "live" && (opt.gridDumpPath.empty() || opt.exclusionsDumpPath.empty()))
+    {
+        throw std::runtime_error("live pairlist source requires --grid-dump and --exclusions-dump");
     }
     if (opt.iterations <= 0 || opt.warmup < 0 || opt.repeats <= 0)
     {
@@ -391,11 +430,143 @@ Stats runSpongeRepeated(Runtime& rt, const CliOptions& opt)
     return aggregate(samples);
 }
 
+LJEwaldForceSummary summarizeForces(const std::vector<float3>& forces)
+{
+    LJEwaldForceSummary summary;
+    for (const auto& force : forces)
+    {
+        summary.sumX += force.x;
+        summary.sumY += force.y;
+        summary.sumZ += force.z;
+        summary.l1Norm += std::abs(force.x) + std::abs(force.y) + std::abs(force.z);
+        summary.l2Norm += static_cast<double>(force.x) * force.x + static_cast<double>(force.y) * force.y
+                          + static_cast<double>(force.z) * force.z;
+        summary.maxAbs = std::max(summary.maxAbs,
+                                  std::max(std::abs(static_cast<double>(force.x)),
+                                           std::max(std::abs(static_cast<double>(force.y)),
+                                                    std::abs(static_cast<double>(force.z)))));
+    }
+    summary.l2Norm = std::sqrt(summary.l2Norm);
+    return summary;
+}
+
+std::uint64_t checksumForces(const std::vector<float3>& forces)
+{
+    std::uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](float value)
+    {
+        std::uint32_t bits = 0U;
+        std::memcpy(&bits, &value, sizeof(bits));
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+    };
+
+    for (const auto& force : forces)
+    {
+        mix(force.x);
+        mix(force.y);
+        mix(force.z);
+    }
+    return hash;
+}
+
+std::vector<float3> computeForces(Runtime& rt)
+{
+    FrozenKernelContext ctx = makeKernelContext(rt);
+
+    checkCuda(cudaMemsetAsync(rt.d_f, 0, sizeof(float3) * rt.fixture.xq.size(), rt.stream), "force memset f");
+    checkCuda(cudaMemsetAsync(rt.d_fShift, 0, sizeof(float3) * rt.fixture.shiftVec.size(), rt.stream),
+              "force memset fshift");
+    launchLJEwaldFrozenKernel(ctx, false);
+    checkCuda(cudaStreamSynchronize(rt.stream), "force sync");
+
+    std::vector<float3> forces(rt.fixture.xq.size());
+    checkCuda(cudaMemcpy(forces.data(),
+                         rt.d_f,
+                         sizeof(float3) * forces.size(),
+                         cudaMemcpyDeviceToHost),
+              "copy forces");
+    return forces;
+}
+
+bool forceReferenceAvailable(const FixtureHeader& header)
+{
+    return header.forceChecksum != 0U || header.referenceForceSummary.l1Norm != 0.0
+           || header.referenceForceSummary.l2Norm != 0.0 || header.referenceForceSummary.maxAbs != 0.0;
+}
+
+bool equalForceSummary(const LJEwaldForceSummary& lhs, const LJEwaldForceSummary& rhs)
+{
+    return lhs.sumX == rhs.sumX && lhs.sumY == rhs.sumY && lhs.sumZ == rhs.sumZ && lhs.l1Norm == rhs.l1Norm
+           && lhs.l2Norm == rhs.l2Norm && lhs.maxAbs == rhs.maxAbs;
+}
+
 void printStats(const char* label, const Stats& s)
 {
     std::cout << label << "_us_min: " << s.minUs << "\n";
     std::cout << label << "_us_avg: " << s.avgUs << "\n";
     std::cout << label << "_us_max: " << s.maxUs << "\n";
+}
+
+struct ForceDiffStats
+{
+    double rms = 0.0;
+    double maxAbs = 0.0;
+    std::size_t worstAtom = 0;
+    int worstComponent = 0;
+    double worstObserved = 0.0;
+    double worstReference = 0.0;
+};
+
+ForceDiffStats computeForceDiffStats(const std::vector<float3>& observed, const std::vector<Float3>& reference)
+{
+    if (observed.size() != reference.size())
+    {
+        throw std::runtime_error("force array size mismatch");
+    }
+
+    ForceDiffStats stats;
+    double sumSq = 0.0;
+    std::size_t componentCount = 0;
+    for (std::size_t atom = 0; atom < observed.size(); ++atom)
+    {
+        const std::array<double, 3> obs = { observed[atom].x, observed[atom].y, observed[atom].z };
+        const std::array<double, 3> ref = { reference[atom].x, reference[atom].y, reference[atom].z };
+        for (int component = 0; component < 3; ++component)
+        {
+            const double diff = obs[component] - ref[component];
+            const double absDiff = std::abs(diff);
+            sumSq += diff * diff;
+            ++componentCount;
+            if (absDiff > stats.maxAbs)
+            {
+                stats.maxAbs = absDiff;
+                stats.worstAtom = atom;
+                stats.worstComponent = component;
+                stats.worstObserved = obs[component];
+                stats.worstReference = ref[component];
+            }
+        }
+    }
+
+    if (componentCount > 0)
+    {
+        stats.rms = std::sqrt(sumSq / static_cast<double>(componentCount));
+    }
+    return stats;
+}
+
+NbnxmPairlistHost makePairlist(const CliOptions& options, const FixtureData& fixture)
+{
+    if (options.pairlistSource == "fixture")
+    {
+        return fixture.pairlist;
+    }
+
+    const StageGridDump grid = loadStageGrid(options.gridDumpPath);
+    const ExclusionsDump exclusions = loadExclusions(options.exclusionsDumpPath);
+    const auto input = makeOrthorhombicNoPruneInput(fixture, grid, &exclusions);
+    return buildPairlistOrthorhombicNoPrune(input);
 }
 
 } // namespace
@@ -411,23 +582,104 @@ int main(int argc, char** argv)
         const CliOptions options = parseCli(argc, argv);
         const sponge::nbnxm::FixtureData fixture = sponge::nbnxm::loadFixture(options.fixturePath);
 
-        NbnxmPairlistHost pairlist = fixture.pairlist;
-
-        Runtime rt = makeRuntime(fixture, pairlist);
-        const Stats spongeStats = runSpongeRepeated(rt, options);
-
         std::cout << "fixture: " << options.fixturePath << "\n";
         std::cout << "variant: " << fixture.header.variantName << "\n";
-        std::cout << "gpu: " << rt.gpuName << "\n";
-        std::cout << "sm: " << rt.smMajor << "." << rt.smMinor << "\n";
         std::cout << "waters: " << fixture.header.numWaters << "\n";
         std::cout << "atoms: " << fixture.header.numAtoms << "\n";
         std::cout << "iters: " << options.iterations << " warmup: " << options.warmup
                   << " repeats: " << options.repeats << "\n";
-        std::cout << "pairlist_source: fixture\n";
+        const NbnxmPairlistHost pairlist = makePairlist(options, fixture);
+        std::cout << "pairlist_source: " << options.pairlistSource << "\n";
         std::cout << "pairlist_sci: " << pairlist.sci.size()
                   << " pairlist_cjPacked: " << pairlist.cjPacked.size()
                   << " pairlist_excl: " << pairlist.excl.size() << "\n";
+
+        if (options.mode == "pairlist-only")
+        {
+            if (options.pairlistDumpPath.empty())
+            {
+                std::cerr << "pairlist-only mode requires --pairlist-dump\n";
+                return 3;
+            }
+
+            const StagePairlistDump pairlistDump = loadStagePairlist(options.pairlistDumpPath);
+            StagePairlistDump fixtureDump;
+            fixtureDump.header.rlist = pairlist.rlist;
+            fixtureDump.header.nciTot = pairlist.nci_tot;
+            fixtureDump.header.numSci = static_cast<std::uint32_t>(pairlist.sci.size());
+            fixtureDump.header.numPackedJClusters = static_cast<std::uint32_t>(pairlist.cjPacked.size());
+            fixtureDump.header.numExcl = static_cast<std::uint32_t>(pairlist.excl.size());
+            fixtureDump.pairlist = pairlist;
+
+            const CompareResult result = comparePairlistBytes(fixtureDump, pairlistDump);
+            std::cout << "pairlist_compare: " << (result.equal ? "PASS" : "FAIL") << "\n";
+            if (!result.equal)
+            {
+                std::cout << "pairlist_compare_message: " << result.message << "\n";
+                return 2;
+            }
+            return 0;
+        }
+
+        Runtime rt                  = makeRuntime(fixture, pairlist);
+        std::cout << "gpu: " << rt.gpuName << "\n";
+        std::cout << "sm: " << rt.smMajor << "." << rt.smMinor << "\n";
+
+        if (options.mode == "pairlist+kernel")
+        {
+            const auto forces = computeForces(rt);
+            const auto summary = summarizeForces(forces);
+            const auto checksum = checksumForces(forces);
+            std::cout << "force_checksum: " << checksum << "\n";
+            std::cout << "force_sum_x: " << summary.sumX << "\n";
+            std::cout << "force_sum_y: " << summary.sumY << "\n";
+            std::cout << "force_sum_z: " << summary.sumZ << "\n";
+            std::cout << "force_l1: " << summary.l1Norm << "\n";
+            std::cout << "force_l2: " << summary.l2Norm << "\n";
+            std::cout << "force_max_abs: " << summary.maxAbs << "\n";
+
+            if (!forceReferenceAvailable(fixture.header))
+            {
+                std::cout << "kernel_compare: NO_REFERENCE\n";
+                return 3;
+            }
+
+            std::cout << "reference_force_checksum: " << fixture.header.forceChecksum << "\n";
+            std::cout << "reference_force_sum_x: " << fixture.header.referenceForceSummary.sumX << "\n";
+            std::cout << "reference_force_sum_y: " << fixture.header.referenceForceSummary.sumY << "\n";
+            std::cout << "reference_force_sum_z: " << fixture.header.referenceForceSummary.sumZ << "\n";
+            std::cout << "reference_force_l1: " << fixture.header.referenceForceSummary.l1Norm << "\n";
+            std::cout << "reference_force_l2: " << fixture.header.referenceForceSummary.l2Norm << "\n";
+            std::cout << "reference_force_max_abs: " << fixture.header.referenceForceSummary.maxAbs << "\n";
+
+            const bool checksumMatch = (checksum == fixture.header.forceChecksum);
+            const bool summaryMatch = equalForceSummary(summary, fixture.header.referenceForceSummary);
+            std::cout << "kernel_compare: " << ((checksumMatch && summaryMatch) ? "PASS" : "FAIL") << "\n";
+            if (!checksumMatch)
+            {
+                std::cout << "kernel_compare_message: force checksum mismatch\n";
+            }
+            else if (!summaryMatch)
+            {
+                std::cout << "kernel_compare_message: force summary mismatch\n";
+            }
+            if (!options.referenceForceDumpPath.empty())
+            {
+                const auto referenceForces = loadForces(options.referenceForceDumpPath);
+                const auto diffStats = computeForceDiffStats(forces, referenceForces.forces);
+                static constexpr const char* componentNames[3] = { "x", "y", "z" };
+                std::cout << "force_array_compare: AVAILABLE\n";
+                std::cout << "force_array_rms: " << diffStats.rms << "\n";
+                std::cout << "force_array_max_abs: " << diffStats.maxAbs << "\n";
+                std::cout << "force_array_worst_atom: " << diffStats.worstAtom << "\n";
+                std::cout << "force_array_worst_component: " << componentNames[diffStats.worstComponent] << "\n";
+                std::cout << "force_array_worst_observed: " << diffStats.worstObserved << "\n";
+                std::cout << "force_array_worst_reference: " << diffStats.worstReference << "\n";
+            }
+            return (checksumMatch && summaryMatch) ? 0 : 2;
+        }
+
+        const Stats spongeStats = runSpongeRepeated(rt, options);
         printStats("sponge_frozen", spongeStats);
 
         if (options.mode == "compare")
@@ -446,7 +698,6 @@ int main(int argc, char** argv)
             std::cout << "result: FAIL\n";
             return 2;
         }
-
         return 0;
     }
     catch (const std::exception& ex)

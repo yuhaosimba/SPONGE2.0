@@ -107,7 +107,102 @@ add_executable(
   nbnxm_frozen_bench
   ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/frozen_port/nbnxm_frozen_bench.cu
   ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/frozen_port/ljewald_kernel_frozen_port.cu
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_exclusions.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_force_dump.cpp
   ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_live_builder_input.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_compare.cpp
   ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
 target_link_libraries(nbnxm_frozen_bench PRIVATE sponge_toml)
 install(TARGETS nbnxm_frozen_bench RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(
+  nbnxm_stage_compare
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage_compare.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_compare.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_stage_compare PRIVATE sponge_toml)
+install(TARGETS nbnxm_stage_compare RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(
+  nbnxm_builder_compare
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder_compare.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_exclusions.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_live_builder_input.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_compare.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_builder_compare PRIVATE sponge_toml)
+install(TARGETS nbnxm_builder_compare RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_executable(
+  nbnxm_stage_io_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_stage_io_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_stage_io_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_compare_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_compare_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_compare.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_compare_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_builder_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_builder_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_builder_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_grid_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_grid_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_grid_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_pairlist_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_pairlist_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_pairlist_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_live_builder_input_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_live_builder_input_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_builder.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_exclusions.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_live_builder_input.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_compare.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_live_builder_input_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_force_dump_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_force_dump_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_force_dump.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp)
+target_link_libraries(nbnxm_force_dump_test PRIVATE sponge_toml)
+
+add_executable(
+  nbnxm_layout_test
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/tests/nbnxm_layout_test.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_pairlist_types.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_fixture.cpp
+  ${PROJECT_ROOT_DIR}/SPONGE/nbnxm/nbnxm_stage.cpp)
+target_link_libraries(nbnxm_layout_test PRIVATE sponge_toml)

@@ -2,6 +2,7 @@
 
 #include "nbnxm_pairlist_types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -68,6 +69,22 @@ struct FixtureHeader
     char waterModel[16] = {};
     char variantName[64] = {};
 };
+
+static_assert(sizeof(LJEwaldForceSummary) == 48, "LJEwaldForceSummary layout mismatch");
+static_assert(sizeof(FixtureHeader) == 336, "FixtureHeader layout mismatch");
+static_assert(offsetof(FixtureHeader, magic) == 0, "FixtureHeader::magic offset mismatch");
+static_assert(offsetof(FixtureHeader, layoutType) == 16, "FixtureHeader::layoutType offset mismatch");
+static_assert(offsetof(FixtureHeader, numWaters) == 48, "FixtureHeader::numWaters offset mismatch");
+static_assert(offsetof(FixtureHeader, effectiveClusterPairs) == 80,
+              "FixtureHeader::effectiveClusterPairs offset mismatch");
+static_assert(offsetof(FixtureHeader, forceChecksum) == 96,
+              "FixtureHeader::forceChecksum offset mismatch");
+static_assert(offsetof(FixtureHeader, referenceForceSummary) == 104,
+              "FixtureHeader::referenceForceSummary offset mismatch");
+static_assert(offsetof(FixtureHeader, fixtureName) == 192,
+              "FixtureHeader::fixtureName offset mismatch");
+static_assert(offsetof(FixtureHeader, waterModel) == 256, "FixtureHeader::waterModel offset mismatch");
+static_assert(offsetof(FixtureHeader, variantName) == 272, "FixtureHeader::variantName offset mismatch");
 
 struct FixtureData
 {

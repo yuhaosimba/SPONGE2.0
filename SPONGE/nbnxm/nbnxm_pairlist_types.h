@@ -2,6 +2,7 @@
 
 #include "nbnxm_pairlist_layout.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -13,6 +14,11 @@ struct Float2
 {
     float x;
     float y;
+
+    bool operator==(const Float2& other) const
+    {
+        return x == other.x && y == other.y;
+    }
 };
 
 struct Float3
@@ -20,6 +26,11 @@ struct Float3
     float x;
     float y;
     float z;
+
+    bool operator==(const Float3& other) const
+    {
+        return x == other.x && y == other.y && z == other.z;
+    }
 };
 
 struct Float4
@@ -28,6 +39,11 @@ struct Float4
     float y;
     float z;
     float w;
+
+    bool operator==(const Float4& other) const
+    {
+        return x == other.x && y == other.y && z == other.z && w == other.w;
+    }
 };
 
 struct nbnxn_sci_t
@@ -36,23 +52,45 @@ struct nbnxn_sci_t
     int shift;
     int cjPackedBegin;
     int cjPackedEnd;
+
+    bool operator==(const nbnxn_sci_t& other) const
+    {
+        return sci == other.sci && shift == other.shift && cjPackedBegin == other.cjPackedBegin
+               && cjPackedEnd == other.cjPackedEnd;
+    }
 };
 
 struct nbnxn_im_ei_t
 {
     std::uint32_t imask = 0U;
     int excl_ind = 0;
+
+    bool operator==(const nbnxn_im_ei_t& other) const
+    {
+        return imask == other.imask && excl_ind == other.excl_ind;
+    }
 };
 
 struct nbnxn_cj_packed_t
 {
     int cj[c_jGroupSize];
     nbnxn_im_ei_t imei[c_clusterPairSplit];
+
+    bool operator==(const nbnxn_cj_packed_t& other) const
+    {
+        return std::equal(std::begin(cj), std::end(cj), std::begin(other.cj), std::end(other.cj))
+               && std::equal(std::begin(imei), std::end(imei), std::begin(other.imei), std::end(other.imei));
+    }
 };
 
 struct nbnxn_excl_t
 {
     std::uint32_t pair[c_exclSize];
+
+    bool operator==(const nbnxn_excl_t& other) const
+    {
+        return std::equal(std::begin(pair), std::end(pair), std::begin(other.pair), std::end(other.pair));
+    }
 };
 
 static_assert(sizeof(nbnxn_sci_t) == 16, "nbnxn_sci_t must match GROMACS layout");
