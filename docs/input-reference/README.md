@@ -15,6 +15,7 @@ SPONGE -mdin mdin.spg.toml
 - [Constraints](constraint.md) — SETTLE / SHAKE
 - [Neighbor List](neighbor-list.md) — neighbor list configuration
 - [PME Electrostatics](pme.md) — Particle Mesh Ewald
+- [Collective Variables](collective-variables.md) — CV definitions and examples
 - [Enhanced Sampling](enhanced-sampling.md) — CV, MetaD, SITS
 - [SinkMeta](sinkmeta.md) — detailed `meta` / SinkMeta parameter reference
 - [Advanced](advanced.md) — device, wall constraints, ReaxFF, plugins

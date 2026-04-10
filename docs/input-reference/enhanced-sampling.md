@@ -6,7 +6,11 @@
 |-----------|------|-------------|
 | `cv_in_file` | string | Collective variable definition file path |
 
-CVs can also be defined inline via the `[CV]` section:
+CV definitions are loaded from the file pointed to by `cv_in_file`. New CV
+files should use TOML; the legacy block format remains supported for
+compatibility. See
+[Collective Variables Guide](collective-variables.md) for the supported CV
+types, virtual atoms, printing, and complete examples.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
