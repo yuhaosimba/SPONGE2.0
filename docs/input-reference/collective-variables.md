@@ -66,6 +66,9 @@ psi
    modules that consume CV names.
 4. Run SPONGE and inspect the corresponding output columns in `mdout`.
 
+This page documents CV-side `restrain`, which is different from the atom-
+coordinate restrain module documented in [restrain.md](restrain.md).
+
 ## CV definitions
 
 Each CV is defined in a named module. The module name is how other sections
