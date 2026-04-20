@@ -1301,8 +1301,7 @@ static void Gromacs_Instantiate_System(const Gromacs_Topology& topology,
                 adjacency[aj_local].push_back(ai_local);
             };
 
-            auto append_constraint =
-                [&](int ai_local, int aj_local, float r0)
+            auto append_constraint = [&](int ai_local, int aj_local, float r0)
             {
                 require_local_atom(ai_local);
                 require_local_atom(aj_local);
@@ -1376,9 +1375,9 @@ static void Gromacs_Instantiate_System(const Gromacs_Topology& topology,
                 }
                 append_bond(constraint.ai - 1, constraint.aj - 1, 0.0f,
                             Gromacs_To_Angstrom(constraint.parameters[0]));
-                append_constraint(constraint.ai - 1, constraint.aj - 1,
-                                  Gromacs_To_Angstrom(
-                                      constraint.parameters[0]));
+                append_constraint(
+                    constraint.ai - 1, constraint.aj - 1,
+                    Gromacs_To_Angstrom(constraint.parameters[0]));
             }
 
             for (int i = 0; i < static_cast<int>(molecule.atoms.size()); i++)
