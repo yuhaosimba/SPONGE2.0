@@ -1,7 +1,12 @@
+import json
 import os
 import subprocess
 import textwrap
 from pathlib import Path
+
+
+def _toml_string(value):
+    return json.dumps(os.fspath(value))
 
 
 def _gro_atom(resid, resname, atomname, atomnr, xyz):
@@ -103,9 +108,9 @@ def test_direct_gromacs_topgro_accepts_settles_constraints_and_cmap(tmp_path):
             dt = 0
             cutoff = 8.0
             constrain_mode = "SETTLE"
-            gromacs_top = "{top_path}"
-            gromacs_gro = "{gro_path}"
-            default_out_file_prefix = "{tmp_path / "direct_feature"}"
+            gromacs_top = {_toml_string(top_path)}
+            gromacs_gro = {_toml_string(gro_path)}
+            default_out_file_prefix = {_toml_string(tmp_path / "direct_feature")}
             print_zeroth_frame = 1
             write_mdout_interval = 1
             """
