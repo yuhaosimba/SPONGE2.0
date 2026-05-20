@@ -19,9 +19,8 @@ class ManagerPrinter
                              const Manager& manager) const;
     void PrintSingleRunSummary(
         const std::vector<BlockExecutionResult>& results) const;
-    void PrintEpochReport(const std::string& mode, int epoch,
-                          int total_epochs, int exchange_round,
-                          int block_steps,
+    void PrintEpochReport(const std::string& mode, int epoch, int total_epochs,
+                          int exchange_round, int block_steps,
                           const std::vector<BlockExecutionResult>& results,
                           const std::vector<ExchangeAttempt>& attempts,
                           int cumulative_accepted,

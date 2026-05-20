@@ -251,6 +251,7 @@ def _write_fep_rest2_manager_config(
         "thermostat_tau = 0.1",
         "thermostat_seed = 2026",
         "target_temperature = 300.0",
+        "target_pressure = 1.0",
         "velocity_max = 20",
         'REST2_mode = "on"',
         f"REST2_atom_numbers = {FEP_REST2_HOT_ATOMS}",
