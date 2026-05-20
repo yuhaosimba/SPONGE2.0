@@ -267,7 +267,8 @@ sponge::SchedulerSnapshot Main_Get_Scheduler_Snapshot()
     snapshot.temperature = md_info.sys.h_temperature;
     snapshot.target_temperature = md_info.sys.target_temperature;
     snapshot.pressure = md_info.sys.h_pressure * CONSTANT_PRES_CONVERTION;
-    snapshot.target_pressure = md_info.sys.target_pressure;
+    snapshot.target_pressure =
+        md_info.sys.target_pressure * CONSTANT_PRES_CONVERTION;
     snapshot.total_potential = dd.h_sum_ene_total;
     snapshot.effective_potential = md_info.sys.h_potential;
     snapshot.box_length = {md_info.sys.box_length.x, md_info.sys.box_length.y,
@@ -572,7 +573,8 @@ sponge::WorkerExchangeObservable Main_Collect_Exchange_Observables()
     observable.temperature = md_info.sys.h_temperature;
     observable.target_temperature = md_info.sys.target_temperature;
     observable.pressure = md_info.sys.h_pressure * CONSTANT_PRES_CONVERTION;
-    observable.target_pressure = md_info.sys.target_pressure;
+    observable.target_pressure =
+        md_info.sys.target_pressure * CONSTANT_PRES_CONVERTION;
     observable.volume = md_info.sys.Get_Volume();
     return observable;
 }

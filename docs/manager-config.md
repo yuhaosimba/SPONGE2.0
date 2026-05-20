@@ -366,6 +366,7 @@ thermostat = "middle_langevin"
 thermostat_tau = 0.1
 thermostat_seed = 2026
 target_temperature = 300.0
+target_pressure = 1.0
 velocity_max = 20
 REST2_mode = "on"
 REST2_atom_numbers = 55

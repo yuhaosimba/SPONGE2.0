@@ -13,10 +13,7 @@ namespace
 
 constexpr int kLineWidth = 80;
 
-std::string Rule(char value = '=')
-{
-    return std::string(kLineWidth, value);
-}
+std::string Rule(char value = '=') { return std::string(kLineWidth, value); }
 
 std::string ModeLabel(const std::string& mode)
 {
@@ -63,8 +60,7 @@ std::string FormatInputValue(const ScheduleInputValue& value)
 }
 
 void AppendInputIfPresent(std::vector<std::string>* parts,
-                          const ScheduleInputs& inputs,
-                          const std::string& key)
+                          const ScheduleInputs& inputs, const std::string& key)
 {
     if (parts == nullptr)
     {
@@ -132,9 +128,9 @@ int MaxObservedStep(const std::vector<BlockExecutionResult>& results)
 
 int CountAccepted(const std::vector<ExchangeAttempt>& attempts)
 {
-    return static_cast<int>(std::count_if(
-        attempts.begin(), attempts.end(),
-        [](const ExchangeAttempt& attempt) { return attempt.accepted; }));
+    return static_cast<int>(std::count_if(attempts.begin(), attempts.end(),
+                                          [](const ExchangeAttempt& attempt)
+                                          { return attempt.accepted; }));
 }
 
 void PrintWorkerTable(std::ostream& out,
@@ -220,8 +216,8 @@ void ManagerPrinter::PrintStartupSummary(
                                   : schedule.config.schedule_id;
         out_ << std::left << std::setw(10) << schedule.config.schedule_id
              << std::setw(12) << schedule.config.worker.name << std::setw(8)
-             << walker_id << KeyParameterSummary(schedule.config.inputs,
-                                                 execution.remd_mode)
+             << walker_id
+             << KeyParameterSummary(schedule.config.inputs, execution.remd_mode)
              << '\n';
     }
     out_ << Rule() << '\n';
@@ -246,17 +242,16 @@ void ManagerPrinter::PrintEpochReport(
 {
     const int accepted = CountAccepted(attempts);
     out_ << Rule('-') << '\n';
-    out_ << ModeLabel(mode) << " Epoch " << (epoch + 1) << " / "
-         << total_epochs << " | Round " << exchange_round
-         << " | Block steps " << block_steps << " | Current step "
-         << MaxObservedStep(results) << '\n';
+    out_ << ModeLabel(mode) << " Epoch " << (epoch + 1) << " / " << total_epochs
+         << " | Round " << exchange_round << " | Block steps " << block_steps
+         << " | Current step " << MaxObservedStep(results) << '\n';
     out_ << Rule('-') << '\n';
     PrintWorkerTable(out_, results);
     PrintExchangeTable(out_, attempts);
     out_ << Rule('-') << '\n';
-    out_ << "Epoch summary: accepted " << accepted << " / "
-         << attempts.size() << ", cumulative accepted " << cumulative_accepted
-         << " / " << cumulative_attempts << '\n';
+    out_ << "Epoch summary: accepted " << accepted << " / " << attempts.size()
+         << ", cumulative accepted " << cumulative_accepted << " / "
+         << cumulative_attempts << '\n';
 }
 
 }  // namespace sponge::manager
