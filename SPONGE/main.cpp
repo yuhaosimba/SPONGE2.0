@@ -530,7 +530,21 @@ void Main_Import_Runtime_State(const sponge::RuntimeState& state)
     }
     md_info.pbc.PBC_Check();
     md_info.output.current_crd_synchronized_step = -1;
-    Main_Refresh_Local_State(true);
+    const bool rebuild_domain_decomposition = CONTROLLER::PP_MPI_size > 1;
+    if (rebuild_domain_decomposition)
+    {
+        dd.Free_Buffer();
+        dd.Domain_Decomposition(&controller, &md_info);
+        pm.Domain_Decomposition(&controller, md_info.sys.box_length,
+                                dd.dom_dec_split_num);
+        pm.Send_Recv_Dom_Dec(&controller);
+        pm.Find_Neighbor_Domain(&controller);
+    }
+    Main_Refresh_Local_State(rebuild_domain_decomposition);
+    if (rebuild_domain_decomposition)
+    {
+        plugin.Set_Domain_Information(&dd);
+    }
     if (state.has_local_accelerations &&
         CONTROLLER::MPI_rank < CONTROLLER::PP_MPI_size)
     {
