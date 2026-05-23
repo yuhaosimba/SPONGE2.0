@@ -1,400 +1,6 @@
 ﻿#include "SITS.h"
 
-template <bool need_force, bool need_energy, bool need_virial,
-          bool need_coulomb>
-static __global__ void Selective_Lennard_Jones_And_Direct_Coulomb_Device(
-    const int local_atom_numbers, const int solvent_numbers,
-    const ATOM_GROUP* nl, float* atom_ene_LJ, const VECTOR_LJ* crd,
-    const LTMatrix3 cell, const LTMatrix3 rcell, const float* LJ_type_A,
-    const float* LJ_type_B, const int* atom_sys_mark, const float cutoff,
-    VECTOR* frc, VECTOR* frc_enhancing, const float pme_beta,
-    float* atom_energy, float* atom_energy_enhancing, LTMatrix3* atom_virial,
-    LTMatrix3* atom_virial_enhancing, float* atom_direct_cf_energy,
-    const float pwwp_factor)
-{
-#ifdef USE_GPU
-    int atom_i = blockDim.y * blockIdx.x + threadIdx.y;
-    if (atom_i < local_atom_numbers - solvent_numbers)
-#else
-#pragma omp parallel for
-    for (int atom_i = 0; atom_i < local_atom_numbers - solvent_numbers;
-         atom_i++)
-#endif
-    {
-        ATOM_GROUP nl_i = nl[atom_i];
-        VECTOR_LJ r1 = crd[atom_i];
-        int atom_mark_i = atom_sys_mark[atom_i];
-        VECTOR frc_record = {0.0f, 0.0f, 0.0f},
-               frc_enhancing_record = {0.0f, 0.0f, 0.0f};
-        LTMatrix3 virial_record = {0, 0, 0, 0, 0, 0},
-                  virial_enhancing = {0, 0, 0, 0, 0, 0};
-        float energy_lj = 0.0f, energy_enhancing = 0.0f, energy_coulomb = 0.0f;
-#ifdef USE_GPU
-        for (int j = threadIdx.x; j < nl_i.atom_numbers; j += blockDim.x)
-#else
-        for (int j = 0; j < nl_i.atom_numbers; j++)
-#endif
-        {
-            int atom_j = nl_i.atom_serial[j];
-            float ij_factor = atom_j < local_atom_numbers ? 1.0f : 0.5f;
-            VECTOR_LJ r2 = crd[atom_j];
-            VECTOR dr = Get_Periodic_Displacement(r2, r1, cell, rcell);
-            float dr_abs = norm3df(dr.x, dr.y, dr.z);
-            if (dr_abs < cutoff)
-            {
-                int atom_mark_j = atom_sys_mark[atom_j] + atom_mark_i;
-                int atom_pair_LJ_type = Get_LJ_Type(r1.LJ_type, r2.LJ_type);
-                float A = LJ_type_A[atom_pair_LJ_type];
-                float B = LJ_type_B[atom_pair_LJ_type];
-                float factor = 0;
-                if (atom_mark_j == 0)
-                {
-                    factor = 1;
-                }
-                else if (atom_mark_j == 1)
-                {
-                    factor = pwwp_factor;
-                }
-                if (need_force)
-                {
-                    float frc_abs = Get_LJ_Force(r1, r2, dr_abs, A, B);
-                    if (need_coulomb)
-                    {
-                        float frc_cf_abs =
-                            Get_Direct_Coulomb_Force(r1, r2, dr_abs, pme_beta);
-                        frc_abs = frc_abs - frc_cf_abs;
-                    }
-                    VECTOR frc_lin = frc_abs * dr;
-                    frc_record = frc_record + frc_lin;
-                    if (atom_j < local_atom_numbers)
-                        atomicAdd(frc + atom_j, -frc_lin);
-                    frc_lin = factor * frc_lin;
-                    frc_enhancing_record = frc_enhancing_record + frc_lin;
-                    if (need_virial)
-                    {
-                        LTMatrix3 virial0 =
-                            Get_Virial_From_Force_Dis(frc_lin, dr);
-                        virial_record = virial_record + ij_factor * virial0;
-                        virial_enhancing =
-                            virial_enhancing + ij_factor * factor * virial0;
-                    }
-                }
-                if (need_coulomb && need_energy)
-                {
-                    float energy_lin =
-                        Get_Direct_Coulomb_Energy(r1, r2, dr_abs, pme_beta);
-                    energy_coulomb += ij_factor * energy_lin;
-                    energy_enhancing += ij_factor * factor * energy_lin;
-                }
-                if (need_energy)
-                {
-                    float energy_lin = Get_LJ_Energy(r1, r2, dr_abs, A, B);
-                    energy_lj += ij_factor * energy_lin;
-                    energy_enhancing += ij_factor * factor * energy_lin;
-                }
-            }
-        }
-        if (need_force)
-        {
-            Warp_Sum_To(frc + atom_i, frc_record, warpSize);
-            Warp_Sum_To(frc_enhancing + atom_i, frc_enhancing_record, warpSize);
-        }
-        if (need_coulomb && need_energy)
-        {
-            Warp_Sum_To(atom_direct_cf_energy + atom_i, energy_coulomb,
-                        warpSize);
-        }
-        if (need_energy)
-        {
-            Warp_Sum_To(atom_energy + atom_i, energy_lj, warpSize);
-#ifdef USE_GPU
-            if (threadIdx.x == 0)
-#endif
-                atomicAdd(atom_ene_LJ + atom_i, energy_lj);
-            Warp_Sum_To(atom_energy_enhancing + atom_i, energy_enhancing,
-                        warpSize);
-        }
-        if (need_virial)
-        {
-            Warp_Sum_To(atom_virial + atom_i, virial_record, warpSize);
-            Warp_Sum_To(atom_virial_enhancing + atom_i, virial_enhancing,
-                        warpSize);
-        }
-    }
-}
-
-template <bool need_force, bool need_energy, bool need_virial,
-          bool need_coulomb, bool need_du_dlambda>
-static __global__ void
-Selective_Lennard_Jones_And_Direct_Coulomb_Soft_Core_Device(
-    const int local_atom_numbers, const int solvent_numbers,
-    const ATOM_GROUP* nl, float* atom_ene_LJ, const VECTOR_LJ_SOFT_TYPE* crd,
-    const LTMatrix3 cell, const LTMatrix3 rcell, const int* atom_sys_mark,
-    const float* LJ_type_AA, const float* LJ_type_AB, const float* LJ_type_BA,
-    const float* LJ_type_BB, const float cutoff, VECTOR* frc,
-    VECTOR* frc_enhancing, const float pme_beta, float* atom_energy,
-    float* atom_energy_enhancing, LTMatrix3* atom_virial,
-    LTMatrix3* atom_virial_enhancing, float* atom_direct_cf_energy,
-    float* atom_du_dlambda_lj, float* atom_du_dlambda_direct,
-    float* atom_du_dlambda_enhancing, const float lambda, const float alpha,
-    const float p, const float input_sigma_6, const float input_sigma_6_min,
-    const float pwwp_factor)
-{
-    float lambda_ = 1.0 - lambda;
-    float alpha_lambda_p = alpha * powf(lambda, p);
-    float alpha_lambda__p = alpha * powf(lambda_, p);
-#ifdef USE_GPU
-    int atom_i = blockDim.y * blockIdx.x + threadIdx.y;
-    if (atom_i < local_atom_numbers - solvent_numbers)
-#else
-#pragma omp parallel for firstprivate(lambda, alpha_lambda_p, alpha_lambda__p)
-    for (int atom_i = 0; atom_i < local_atom_numbers - solvent_numbers;
-         atom_i++)
-#endif
-    {
-        ATOM_GROUP nl_i = nl[atom_i];
-        VECTOR_LJ_SOFT_TYPE r1 = crd[atom_i];
-        VECTOR frc_record = {0., 0., 0.},
-               frc_enhancing_record = {0.0f, 0.0f, 0.0f};
-        LTMatrix3 virial_record = {0, 0, 0, 0, 0, 0},
-                  virial_enhancing = {0, 0, 0, 0, 0, 0};
-        float energy_total = 0., energy_enhancing = 0.0f;
-        float energy_coulomb = 0.;
-        float du_dlambda_lj = 0.;
-        float du_dlambda_direct = 0.;
-        // float du_dlambda_enhancing = 0.0f;
-        int atom_mark_i = atom_sys_mark[atom_i];
-#ifdef USE_GPU
-        for (int j = threadIdx.x; j < nl_i.atom_numbers; j += blockDim.x)
-#else
-        for (int j = 0; j < nl_i.atom_numbers; j++)
-#endif
-        {
-            int atom_j = nl_i.atom_serial[j];
-            float ij_factor = atom_j < local_atom_numbers ? 1.0f : 0.5f;
-            VECTOR_LJ_SOFT_TYPE r2 = crd[atom_j];
-            VECTOR dr = Get_Periodic_Displacement(r2, r1, cell, rcell);
-            float dr_abs = norm3df(dr.x, dr.y, dr.z);
-            if (dr_abs < cutoff)
-            {
-                int atom_mark_j = atom_sys_mark[atom_j] + atom_mark_i;
-                float factor = 0;
-                if (atom_mark_j == 0)
-                {
-                    factor = 1;
-                }
-                else if (atom_mark_j == 1)
-                {
-                    factor = pwwp_factor;
-                }
-                int atom_pair_LJ_type_A = Get_LJ_Type(r1.LJ_type, r2.LJ_type);
-                int atom_pair_LJ_type_B =
-                    Get_LJ_Type(r1.LJ_type_B, r2.LJ_type_B);
-                float AA = LJ_type_AA[atom_pair_LJ_type_A];
-                float AB = LJ_type_AB[atom_pair_LJ_type_A];
-                float BA = LJ_type_BA[atom_pair_LJ_type_B];
-                float BB = LJ_type_BB[atom_pair_LJ_type_B];
-                if (BA * AA != 0 || BA + AA == 0)
-                {
-                    if (need_force)
-                    {
-                        float frc_abs =
-                            lambda_ * Get_LJ_Force(r1, r2, dr_abs, AA, AB) +
-                            lambda * Get_LJ_Force(r1, r2, dr_abs, BA, BB);
-                        if (need_coulomb)
-                        {
-                            float frc_cf_abs = Get_Direct_Coulomb_Force(
-                                r1, r2, dr_abs, pme_beta);
-                            frc_abs = frc_abs - frc_cf_abs;
-                        }
-                        VECTOR frc_lin = frc_abs * dr;
-                        frc_record = frc_record + frc_lin;
-                        frc_enhancing_record =
-                            frc_enhancing_record + factor * frc_lin;
-                        if (atom_j < local_atom_numbers)
-                        {
-                            atomicAdd(frc + atom_j, -frc_lin);
-                            atomicAdd(frc_enhancing + atom_j,
-                                      -factor * frc_lin);
-                        }
-                        if (need_virial)
-                        {
-                            LTMatrix3 virial0 =
-                                Get_Virial_From_Force_Dis(frc_lin, dr);
-                            virial_record = virial_record + ij_factor * virial0;
-                            virial_enhancing =
-                                virial_enhancing + ij_factor * factor * virial0;
-                        }
-                    }
-                    if (need_coulomb && need_energy)
-                    {
-                        float ene =
-                            Get_Direct_Coulomb_Energy(r1, r2, dr_abs, pme_beta);
-                        energy_coulomb += ij_factor * ene;
-                        energy_enhancing += ij_factor * factor * ene;
-                    }
-                    if (need_energy)
-                    {
-                        float ene =
-                            lambda_ * Get_LJ_Energy(r1, r2, dr_abs, AA, AB) +
-                            lambda * Get_LJ_Energy(r1, r2, dr_abs, BA, BB);
-                        energy_total += ij_factor * ene;
-                        energy_enhancing += ij_factor * factor * ene;
-                    }
-                    if (need_du_dlambda)
-                    {
-                        du_dlambda_lj += Get_LJ_Energy(r1, r2, dr_abs, BA, BB) -
-                                         Get_LJ_Energy(r1, r2, dr_abs, AA, AB);
-                        if (need_coulomb)
-                        {
-                            du_dlambda_direct += Get_Direct_Coulomb_dU_dlambda(
-                                r1, r2, dr_abs, pme_beta);
-                        }
-                    }
-                }
-                else
-                {
-                    float sigma_A = Get_Soft_Core_Sigma(AA, AB, input_sigma_6,
-                                                        input_sigma_6_min);
-                    float sigma_B = Get_Soft_Core_Sigma(BA, BB, input_sigma_6,
-                                                        input_sigma_6_min);
-                    float dr_softcore_A = Get_Soft_Core_Distance(
-                        AA, AB, sigma_A, dr_abs, alpha, p, lambda);
-                    float dr_softcore_B = Get_Soft_Core_Distance(
-                        BB, BA, sigma_B, dr_abs, alpha, p, 1 - lambda);
-                    if (need_force)
-                    {
-                        float frc_abs =
-                            lambda_ * Get_Soft_Core_LJ_Force(r1, r2, dr_abs,
-                                                             dr_softcore_A, AA,
-                                                             AB) +
-                            lambda * Get_Soft_Core_LJ_Force(
-                                         r1, r2, dr_abs, dr_softcore_B, BA, BB);
-                        if (need_coulomb)
-                        {
-                            float frc_cf_abs =
-                                lambda_ * Get_Soft_Core_Direct_Coulomb_Force(
-                                              r1, r2, dr_abs, dr_softcore_A,
-                                              pme_beta) +
-                                lambda * Get_Soft_Core_Direct_Coulomb_Force(
-                                             r1, r2, dr_abs, dr_softcore_B,
-                                             pme_beta);
-                            frc_abs = frc_abs - frc_cf_abs;
-                        }
-                        VECTOR frc_lin = frc_abs * dr;
-                        frc_record = frc_record + frc_lin;
-                        frc_enhancing_record =
-                            frc_enhancing_record + factor * frc_lin;
-                        if (atom_j < local_atom_numbers)
-                        {
-                            atomicAdd(frc + atom_j, -frc_lin);
-                            atomicAdd(frc_enhancing + atom_j,
-                                      -factor * frc_lin);
-                        }
-                        if (need_virial)
-                        {
-                            LTMatrix3 virial0 =
-                                Get_Virial_From_Force_Dis(frc_lin, dr);
-                            virial_record = virial_record + ij_factor * virial0;
-                            virial_enhancing =
-                                virial_enhancing + ij_factor * factor * virial0;
-                        }
-                    }
-                    if (need_coulomb && need_energy)
-                    {
-                        float ene =
-                            lambda_ * Get_Direct_Coulomb_Energy(
-                                          r1, r2, dr_softcore_A, pme_beta) +
-                            lambda * Get_Direct_Coulomb_Energy(
-                                         r1, r2, dr_softcore_B, pme_beta);
-                        energy_coulomb += ij_factor * ene;
-                        energy_enhancing += ij_factor * factor * ene;
-                    }
-                    if (need_energy)
-                    {
-                        float ene =
-                            lambda_ *
-                                Get_LJ_Energy(r1, r2, dr_softcore_A, AA, AB) +
-                            lambda *
-                                Get_LJ_Energy(r1, r2, dr_softcore_B, BA, BB);
-                        energy_total += ij_factor * ene;
-                        energy_enhancing += ij_factor * factor * ene;
-                    }
-                    if (need_du_dlambda)
-                    {
-                        du_dlambda_lj +=
-                            Get_LJ_Energy(r1, r2, dr_softcore_B, BA, BB) -
-                            Get_LJ_Energy(r1, r2, dr_softcore_A, AA, AB);
-                        du_dlambda_lj +=
-                            Get_Soft_Core_dU_dlambda(
-                                Get_LJ_Force(r1, r2, dr_softcore_A, AA, AB),
-                                sigma_A, dr_softcore_A, alpha, p, lambda) -
-                            Get_Soft_Core_dU_dlambda(
-                                Get_LJ_Force(r1, r2, dr_softcore_B, BA, BB),
-                                sigma_B, dr_softcore_B, alpha, p, lambda_);
-                        if (need_coulomb)
-                        {
-                            du_dlambda_direct +=
-                                Get_Direct_Coulomb_Energy(r1, r2, dr_softcore_B,
-                                                          pme_beta) -
-                                Get_Direct_Coulomb_Energy(r1, r2, dr_softcore_A,
-                                                          pme_beta);
-                            du_dlambda_direct +=
-                                Get_Soft_Core_dU_dlambda(
-                                    Get_Direct_Coulomb_Force(
-                                        r1, r2, dr_softcore_B, pme_beta),
-                                    sigma_B, dr_softcore_B, alpha, p, lambda_) -
-                                Get_Soft_Core_dU_dlambda(
-                                    Get_Direct_Coulomb_Force(
-                                        r1, r2, dr_softcore_A, pme_beta),
-                                    sigma_A, dr_softcore_A, alpha, p, lambda);
-                            du_dlambda_direct +=
-                                lambda * Get_Direct_Coulomb_dU_dlambda(
-                                             r1, r2, dr_softcore_B, pme_beta) +
-                                lambda_ * Get_Direct_Coulomb_dU_dlambda(
-                                              r1, r2, dr_softcore_A, pme_beta);
-                        }
-                    }
-                }
-            }
-        }
-        if (need_force)
-        {
-            Warp_Sum_To(frc + atom_i, frc_record, warpSize);
-            Warp_Sum_To(frc_enhancing + atom_i, frc_enhancing_record, warpSize);
-        }
-        if (need_coulomb && need_energy)
-        {
-            Warp_Sum_To(atom_direct_cf_energy + atom_i, energy_coulomb,
-                        warpSize);
-        }
-        if (need_energy)
-        {
-            Warp_Sum_To(atom_energy + atom_i, energy_total, warpSize);
-#ifdef USE_GPU
-            if (threadIdx.x == 0)
-#endif
-                atomicAdd(atom_ene_LJ + atom_i, energy_total);
-            Warp_Sum_To(atom_energy_enhancing + atom_i, energy_enhancing,
-                        warpSize);
-        }
-        if (need_virial)
-        {
-            Warp_Sum_To(atom_virial + atom_i, virial_record, warpSize);
-            Warp_Sum_To(atom_virial_enhancing + atom_i, virial_enhancing,
-                        warpSize);
-        }
-        if (need_du_dlambda)
-        {
-            Warp_Sum_To(atom_du_dlambda_lj, du_dlambda_lj, warpSize);
-            if (need_coulomb)
-            {
-                Warp_Sum_To(atom_du_dlambda_direct, du_dlambda_direct,
-                            warpSize);
-            }
-        }
-    }
-}
+#include "Selective_Pair_Kernels.h"
 
 static __device__ float log_add_log(float a, float b)
 {
@@ -1512,8 +1118,18 @@ void SITS_INFORMATION::SITS_LJ_Direct_CF_Force_With_Atom_Energy_And_Virial(
         }
         if (!local_atom_numbers) return;
 
-        auto f = Selective_Lennard_Jones_And_Direct_Coulomb_Device<true, false,
-                                                                   false, true>;
+        SITS_NORMAL_POLICY policy = {lj_info->d_LJ_energy_atom,
+                                     md_frc,
+                                     pw_select.select_force[0],
+                                     atom_energy,
+                                     pw_select.select_atom_energy[0],
+                                     atom_virial,
+                                     pw_select.select_atom_virial_tensor[0],
+                                     coulomb_atom_ene,
+                                     pwwp_enhance_factor};
+
+        auto f = Selective_LJ_Direct_Coulomb_Device<SITS_NORMAL_POLICY, true,
+                                                    false, false, true>;
         dim3 blockSize = {
             CONTROLLER::device_warp,
             CONTROLLER::device_max_thread / CONTROLLER::device_warp};
@@ -1521,34 +1137,30 @@ void SITS_INFORMATION::SITS_LJ_Direct_CF_Force_With_Atom_Energy_And_Virial(
 
         if (need_potential && !need_pressure)
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Device<true, true,
-                                                                  false, true>;
+            f = Selective_LJ_Direct_Coulomb_Device<SITS_NORMAL_POLICY, true,
+                                                   true, false, true>;
         }
         else if (need_potential && need_pressure)
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Device<true, true,
-                                                                  true, true>;
+            f = Selective_LJ_Direct_Coulomb_Device<SITS_NORMAL_POLICY, true,
+                                                   true, true, true>;
         }
         else if (!need_potential && need_pressure)
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Device<true, false,
-                                                                  true, true>;
+            f = Selective_LJ_Direct_Coulomb_Device<SITS_NORMAL_POLICY, true,
+                                                   false, true, true>;
         }
         else
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Device<true, false,
-                                                                  false, true>;
+            f = Selective_LJ_Direct_Coulomb_Device<SITS_NORMAL_POLICY, true,
+                                                   false, false, true>;
         }
 
-        Launch_Device_Kernel(
-            f, gridSize, blockSize, 0, NULL, local_atom_numbers,
-            solvent_numbers, nl, lj_info->d_LJ_energy_atom,
-            lj_info->crd_with_LJ_parameters_local, cell, rcell, lj_info->d_LJ_A,
-            lj_info->d_LJ_B, atom_sys_mark_local, cutoff, md_frc,
-            pw_select.select_force[0], pme_beta, atom_energy,
-            pw_select.select_atom_energy[0], atom_virial,
-            pw_select.select_atom_virial_tensor[0], coulomb_atom_ene,
-            pwwp_enhance_factor);
+        Launch_Device_Kernel(f, gridSize, blockSize, 0, NULL,
+                             local_atom_numbers, solvent_numbers, nl,
+                             lj_info->crd_with_LJ_parameters_local, cell, rcell,
+                             atom_sys_mark_local, lj_info->d_LJ_A,
+                             lj_info->d_LJ_B, cutoff, pme_beta, policy);
     }
 }
 
@@ -1582,8 +1194,19 @@ void SITS_INFORMATION::
         }
         if (!local_atom_numbers) return;
 
-        auto f = Selective_Lennard_Jones_And_Direct_Coulomb_Soft_Core_Device<
-            true, false, false, true, false>;
+        SITS_SOFT_CORE_POLICY policy = {
+            lj_info->d_LJ_energy_atom,
+            md_frc,
+            pw_select.select_force[0],
+            atom_energy,
+            pw_select.select_atom_energy[0],
+            atom_virial,
+            pw_select.select_atom_virial_tensor[0],
+            coulomb_atom_ene,
+            pwwp_enhance_factor,
+        };
+        auto f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+            SITS_SOFT_CORE_POLICY, true, false, false, true>;
         dim3 blockSize = {
             CONTROLLER::device_warp,
             CONTROLLER::device_max_thread / CONTROLLER::device_warp};
@@ -1591,35 +1214,31 @@ void SITS_INFORMATION::
 
         if (need_potential && !need_pressure)
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Soft_Core_Device<
-                true, true, false, true, false>;
+            f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+                SITS_SOFT_CORE_POLICY, true, true, false, true>;
         }
         else if (need_potential && need_pressure)
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Soft_Core_Device<
-                true, true, true, true, false>;
+            f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+                SITS_SOFT_CORE_POLICY, true, true, true, true>;
         }
         else if (!need_potential && need_pressure)
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Soft_Core_Device<
-                true, false, true, true, false>;
+            f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+                SITS_SOFT_CORE_POLICY, true, false, true, true>;
         }
         else
         {
-            f = Selective_Lennard_Jones_And_Direct_Coulomb_Soft_Core_Device<
-                true, false, false, true, false>;
+            f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+                SITS_SOFT_CORE_POLICY, true, false, false, true>;
         }
         Launch_Device_Kernel(
             f, gridSize, blockSize, 0, NULL, local_atom_numbers,
-            solvent_numbers, nl, lj_info->d_LJ_energy_atom,
-            lj_info->crd_with_LJ_parameters_local, cell, rcell,
-            atom_sys_mark_local, lj_info->d_LJ_AA, lj_info->d_LJ_AB,
-            lj_info->d_LJ_BA, lj_info->d_LJ_BB, cutoff, md_frc,
-            pw_select.select_force[0], pme_beta, atom_energy,
-            pw_select.select_atom_energy[0], atom_virial,
-            pw_select.select_atom_virial_tensor[0], coulomb_atom_ene, NULL,
-            NULL, NULL, lj_info->lambda, lj_info->alpha, lj_info->p,
-            lj_info->sigma_6, lj_info->sigma_6_min, pwwp_enhance_factor);
+            solvent_numbers, nl, lj_info->crd_with_LJ_parameters_local, cell,
+            rcell, atom_sys_mark_local, lj_info->d_LJ_AA, lj_info->d_LJ_AB,
+            lj_info->d_LJ_BA, lj_info->d_LJ_BB, cutoff, pme_beta,
+            lj_info->lambda, lj_info->alpha, lj_info->p, lj_info->sigma_6,
+            lj_info->sigma_6_min, policy);
     }
 }
 

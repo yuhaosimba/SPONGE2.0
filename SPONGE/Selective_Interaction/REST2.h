@@ -41,5 +41,14 @@ struct REST2_INFORMATION
         float* atom_energy_ww, const int need_pressure,
         LTMatrix3* atom_virial_ww, float* elect_atom_ene);
 
+    void LJ_Soft_Core_Direct_CF_Force_With_Atom_Energy_And_Virial(
+        const int atom_numbers, const int local_atom_numbers,
+        const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
+        const float* charge, LJ_SOFT_CORE* lj_info, VECTOR* md_frc,
+        const LTMatrix3 cell, const LTMatrix3 rcell, const ATOM_GROUP* nl,
+        const float cutoff, const float pme_beta, const int need_energy,
+        float* atom_energy_ww, const int need_pressure,
+        LTMatrix3* atom_virial_ww, float* elect_atom_ene);
+
     bool Is_Probe_Safe() const;
 };

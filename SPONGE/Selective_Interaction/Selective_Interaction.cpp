@@ -125,10 +125,11 @@ void SELECTIVE_INTERACTION::
 {
     if (rest2.is_initialized)
     {
-        lj_info->LJ_Soft_Core_PME_Direct_Force_With_Atom_Energy_And_Virial(
+        rest2.LJ_Soft_Core_Direct_CF_Force_With_Atom_Energy_And_Virial(
             atom_numbers, local_atom_numbers, solvent_numbers, ghost_numbers,
-            crd, charge, frc, cell, rcell, nl, pme_beta, need_energy,
-            atom_energy_ww, need_pressure, atom_virial_ww, elect_atom_ene);
+            crd, charge, lj_info, frc, cell, rcell, nl, cutoff, pme_beta,
+            need_energy, atom_energy_ww, need_pressure, atom_virial_ww,
+            elect_atom_ene);
     }
     else
     {

@@ -1,5 +1,7 @@
 ﻿#include "REST2.h"
 
+#include "Selective_Pair_Kernels.h"
+
 namespace
 {
 
@@ -28,129 +30,6 @@ static __global__ void REST2_Get_Local_Device(int* atom_local,
     SIMPLE_DEVICE_FOR(i, total)
     {
         atom_sys_mark_local[i] = atom_sys_mark[atom_local[i]];
-    }
-}
-
-template <bool need_force, bool need_energy, bool need_virial,
-          bool need_coulomb>
-static __global__ void REST2_Lennard_Jones_And_Direct_Coulomb_Device(
-    const int local_atom_numbers, const int solvent_numbers,
-    const ATOM_GROUP* nl, const VECTOR_LJ* crd, const LTMatrix3 cell,
-    const LTMatrix3 rcell, const float* LJ_type_A, const float* LJ_type_B,
-    const int* atom_sys_mark, const float cutoff, VECTOR* frc,
-    const float pme_beta, float* atom_energy, LTMatrix3* atom_virial,
-    float* atom_direct_cf_energy, float* atom_LJ_ene,
-    float* rest2_unscaled_atom_energy, float* rest2_effective_atom_energy,
-    const float lambda_m, const float sqrt_lambda_m)
-{
-#ifdef USE_GPU
-    int atom_i = blockDim.y * blockIdx.x + threadIdx.y;
-    if (atom_i < local_atom_numbers - solvent_numbers)
-#else
-#pragma omp parallel for schedule(dynamic)
-    for (int atom_i = 0; atom_i < local_atom_numbers - solvent_numbers;
-         atom_i++)
-#endif
-    {
-        VECTOR frc_record = {0.0f, 0.0f, 0.0f};
-        LTMatrix3 virial = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        float energy_lj = 0.0f;
-        float energy_coulomb = 0.0f;
-        float rest2_unscaled = 0.0f;
-        float rest2_effective = 0.0f;
-        ATOM_GROUP nl_i = nl[atom_i];
-        VECTOR_LJ r1 = crd[atom_i];
-        int atom_mark_i = atom_sys_mark[atom_i];
-#ifdef USE_GPU
-        for (int j = threadIdx.x; j < nl_i.atom_numbers; j += blockDim.x)
-#else
-        for (int j = 0; j < nl_i.atom_numbers; j++)
-#endif
-        {
-            int atom_j = nl_i.atom_serial[j];
-            float ij_factor = atom_j < local_atom_numbers ? 1.0f : 0.5f;
-            VECTOR_LJ r2 = crd[atom_j];
-            VECTOR dr = Get_Periodic_Displacement(r2, r1, cell, rcell);
-            float dr_abs = norm3df(dr.x, dr.y, dr.z);
-            if (dr_abs < cutoff)
-            {
-                int atom_pair_LJ_type = Get_LJ_Type(r1.LJ_type, r2.LJ_type);
-                float A = LJ_type_A[atom_pair_LJ_type];
-                float B = LJ_type_B[atom_pair_LJ_type];
-                int mark_sum = atom_mark_i + atom_sys_mark[atom_j];
-                float scale = 1.0f;
-                if (mark_sum == 0)
-                {
-                    scale = lambda_m;
-                }
-                else if (mark_sum == 1)
-                {
-                    scale = sqrt_lambda_m;
-                }
-                if (need_force)
-                {
-                    float frc_abs = Get_LJ_Force(r1, r2, dr_abs, A, B);
-                    if (need_coulomb)
-                    {
-                        float frc_cf_abs =
-                            Get_Direct_Coulomb_Force(r1, r2, dr_abs, pme_beta);
-                        frc_abs = frc_abs - frc_cf_abs;
-                    }
-                    VECTOR frc_lin = scale * frc_abs * dr;
-                    frc_record = frc_record + frc_lin;
-                    if (atom_j < local_atom_numbers)
-                    {
-                        atomicAdd(frc + atom_j, -frc_lin);
-                    }
-                    if (need_virial)
-                    {
-                        virial = virial - ij_factor * Get_Virial_From_Force_Dis(
-                                                          frc_lin, dr);
-                    }
-                }
-                if (need_energy)
-                {
-                    float pair_lj = Get_LJ_Energy(r1, r2, dr_abs, A, B);
-                    float pair_coulomb = 0.0f;
-                    if (need_coulomb)
-                    {
-                        pair_coulomb =
-                            Get_Direct_Coulomb_Energy(r1, r2, dr_abs, pme_beta);
-                    }
-                    float pair_total = pair_lj + pair_coulomb;
-                    energy_lj += ij_factor * scale * pair_lj;
-                    energy_coulomb += ij_factor * scale * pair_coulomb;
-                    if (mark_sum < 2)
-                    {
-                        rest2_unscaled += ij_factor * pair_total;
-                        rest2_effective += ij_factor * scale * pair_total;
-                    }
-                }
-            }
-        }
-        if (need_force)
-        {
-            Warp_Sum_To(frc + atom_i, frc_record, warpSize);
-        }
-        if (need_energy)
-        {
-            float energy_total = energy_lj + energy_coulomb;
-            Warp_Sum_To(atom_energy + atom_i, energy_total, warpSize);
-            Warp_Sum_To(atom_LJ_ene + atom_i, energy_lj, warpSize);
-            if (need_coulomb)
-            {
-                Warp_Sum_To(atom_direct_cf_energy + atom_i, energy_coulomb,
-                            warpSize);
-            }
-            Warp_Sum_To(rest2_unscaled_atom_energy + atom_i, rest2_unscaled,
-                        warpSize);
-            Warp_Sum_To(rest2_effective_atom_energy + atom_i, rest2_effective,
-                        warpSize);
-        }
-        if (need_virial)
-        {
-            Warp_Sum_To(atom_virial + atom_i, virial, warpSize);
-        }
     }
 }
 
@@ -336,33 +215,109 @@ void REST2_INFORMATION::LJ_Direct_CF_Force_With_Atom_Energy_And_Virial(
     }
     if (atom_numbers == 0 || local_atom_numbers == 0) return;
 
-    auto f =
-        REST2_Lennard_Jones_And_Direct_Coulomb_Device<true, false, false, true>;
+    REST2_NORMAL_POLICY policy = {md_frc,
+                                  atom_energy_ww,
+                                  atom_virial_ww,
+                                  elect_atom_ene,
+                                  lj_info->d_LJ_energy_atom,
+                                  d_unscaled_atom_energy,
+                                  d_effective_atom_energy,
+                                  lambda_m,
+                                  sqrt_lambda_m};
+
+    auto f = Selective_LJ_Direct_Coulomb_Device<REST2_NORMAL_POLICY, true,
+                                                false, false, true>;
     dim3 blockSize = {CONTROLLER::device_warp,
                       CONTROLLER::device_max_thread / CONTROLLER::device_warp};
     dim3 gridSize = (atom_numbers + blockSize.y - 1) / blockSize.y;
     if (need_energy && !need_pressure)
     {
-        f = REST2_Lennard_Jones_And_Direct_Coulomb_Device<true, true, false,
-                                                          true>;
+        f = Selective_LJ_Direct_Coulomb_Device<REST2_NORMAL_POLICY, true, true,
+                                               false, true>;
     }
     else if (!need_energy && need_pressure)
     {
-        f = REST2_Lennard_Jones_And_Direct_Coulomb_Device<true, false, true,
-                                                          true>;
+        f = Selective_LJ_Direct_Coulomb_Device<REST2_NORMAL_POLICY, true, false,
+                                               true, true>;
     }
     else if (need_energy && need_pressure)
     {
-        f = REST2_Lennard_Jones_And_Direct_Coulomb_Device<true, true, true,
-                                                          true>;
+        f = Selective_LJ_Direct_Coulomb_Device<REST2_NORMAL_POLICY, true, true,
+                                               true, true>;
+    }
+    Launch_Device_Kernel(f, gridSize, blockSize, 0, NULL, local_atom_numbers,
+                         solvent_numbers, nl,
+                         lj_info->crd_with_LJ_parameters_local, cell, rcell,
+                         atom_sys_mark_local, lj_info->d_LJ_A, lj_info->d_LJ_B,
+                         cutoff, pme_beta, policy);
+}
+
+void REST2_INFORMATION::
+    LJ_Soft_Core_Direct_CF_Force_With_Atom_Energy_And_Virial(
+        const int atom_numbers, const int local_atom_numbers,
+        const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
+        const float* charge, LJ_SOFT_CORE* lj_info, VECTOR* md_frc,
+        const LTMatrix3 cell, const LTMatrix3 rcell, const ATOM_GROUP* nl,
+        const float cutoff, const float pme_beta, const int need_energy,
+        float* atom_energy_ww, const int need_pressure,
+        LTMatrix3* atom_virial_ww, float* elect_atom_ene)
+{
+    if (!is_initialized || !lj_info->is_initialized) return;
+    Launch_Device_Kernel(
+        Copy_Crd_And_Charge_To_New_Crd,
+        (this->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL,
+        local_atom_numbers + ghost_numbers, crd,
+        lj_info->crd_with_LJ_parameters_local, charge);
+    if (need_energy)
+    {
+        deviceMemset(elect_atom_ene, 0,
+                     sizeof(float) * (local_atom_numbers + ghost_numbers));
+        deviceMemset(lj_info->d_LJ_energy_atom, 0,
+                     sizeof(float) * this->atom_numbers);
+    }
+    if (atom_numbers == 0 || local_atom_numbers == 0) return;
+
+    REST2_SOFT_CORE_POLICY policy = {
+        md_frc,
+        atom_energy_ww,
+        atom_virial_ww,
+        elect_atom_ene,
+        lj_info->d_LJ_energy_atom,
+        d_unscaled_atom_energy,
+        d_effective_atom_energy,
+        lambda_m,
+        sqrt_lambda_m,
+    };
+    auto f =
+        Selective_LJ_Direct_Coulomb_Soft_Core_Device<REST2_SOFT_CORE_POLICY,
+                                                     true, false, false, true>;
+    dim3 blockSize = {CONTROLLER::device_warp,
+                      CONTROLLER::device_max_thread / CONTROLLER::device_warp};
+    dim3 gridSize = (atom_numbers + blockSize.y - 1) / blockSize.y;
+    if (need_energy && !need_pressure)
+    {
+        f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+            REST2_SOFT_CORE_POLICY, true, true, false, true>;
+    }
+    else if (!need_energy && need_pressure)
+    {
+        f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+            REST2_SOFT_CORE_POLICY, true, false, true, true>;
+    }
+    else if (need_energy && need_pressure)
+    {
+        f = Selective_LJ_Direct_Coulomb_Soft_Core_Device<
+            REST2_SOFT_CORE_POLICY, true, true, true, true>;
     }
     Launch_Device_Kernel(
         f, gridSize, blockSize, 0, NULL, local_atom_numbers, solvent_numbers,
-        nl, lj_info->crd_with_LJ_parameters_local, cell, rcell, lj_info->d_LJ_A,
-        lj_info->d_LJ_B, atom_sys_mark_local, cutoff, md_frc, pme_beta,
-        atom_energy_ww, atom_virial_ww, elect_atom_ene,
-        lj_info->d_LJ_energy_atom, d_unscaled_atom_energy,
-        d_effective_atom_energy, lambda_m, sqrt_lambda_m);
+        nl, lj_info->crd_with_LJ_parameters_local, cell, rcell,
+        atom_sys_mark_local, lj_info->d_LJ_AA, lj_info->d_LJ_AB,
+        lj_info->d_LJ_BA, lj_info->d_LJ_BB, cutoff, pme_beta, lj_info->lambda,
+        lj_info->alpha, lj_info->p, lj_info->sigma_6, lj_info->sigma_6_min,
+        policy);
 }
 
 bool REST2_INFORMATION::Is_Probe_Safe() const { return true; }

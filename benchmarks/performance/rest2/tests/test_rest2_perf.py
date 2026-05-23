@@ -256,10 +256,10 @@ def _write_fep_rest2_manager_config(
         'REST2_mode = "on"',
         f"REST2_atom_numbers = {FEP_REST2_HOT_ATOMS}",
         'default_out_file_prefix = "fep_rest2"',
-        "write_information_interval = 1000",
-        "write_mdout_interval = 1000",
-        "write_trajectory_interval = 1000",
-        "write_restart_file_interval = 1000",
+        "write_information_interval = 1",
+        "write_mdout_interval = 1",
+        "write_trajectory_interval = 0",
+        "write_restart_file_interval = 0",
         "",
         "[schedules]",
         "ids = [" + ", ".join(str(schedule_id) for schedule_id in ids) + "]",
@@ -358,6 +358,41 @@ def test_fep_npt_rest2_manager_smoke(
         mdout_text = mdout.read_text(encoding="utf-8")
         assert "REST2_lambda_m" in mdout_text
         assert "REST2_bias" in mdout_text
+        rest2_rows = parse_mdout_rows(
+            mdout,
+            (
+                "REST2_lambda_m",
+                "REST2_unscaled",
+                "REST2_effective",
+                "REST2_bias",
+            ),
+            int_columns=(),
+        )
+        assert rest2_rows
+        last_rest2 = rest2_rows[-1]
+        assert math.isclose(
+            last_rest2["REST2_lambda_m"], lambda_m, rel_tol=0.0, abs_tol=1.0e-6
+        )
+        assert not math.isclose(
+            last_rest2["REST2_unscaled"], 0.0, abs_tol=1.0e-4
+        )
+        assert not math.isclose(
+            last_rest2["REST2_effective"], 0.0, abs_tol=1.0e-4
+        )
+        assert math.isclose(
+            last_rest2["REST2_bias"],
+            last_rest2["REST2_effective"] - last_rest2["REST2_unscaled"],
+            rel_tol=0.0,
+            abs_tol=2.0e-4,
+        )
+        if math.isclose(lambda_m, 1.0, rel_tol=0.0, abs_tol=1.0e-6):
+            assert math.isclose(
+                last_rest2["REST2_bias"], 0.0, rel_tol=0.0, abs_tol=1.0e-4
+            )
+        else:
+            assert not math.isclose(
+                last_rest2["REST2_bias"], 0.0, abs_tol=1.0e-4
+            )
         mdinfo_text = mdinfo.read_text()
         assert f"FEP lj lambda: {lambda_lj:.6f}" in mdinfo_text
         assert f"REST2 lambda_m set to {lambda_m:.6f}" in mdinfo_text
@@ -367,6 +402,9 @@ def test_fep_npt_rest2_manager_smoke(
                 "lambda_lj": lambda_lj,
                 "rest2_lambda_m": lambda_m,
                 "mdout_has_rest2_columns": True,
+                "rest2_unscaled": last_rest2["REST2_unscaled"],
+                "rest2_effective": last_rest2["REST2_effective"],
+                "rest2_bias": last_rest2["REST2_bias"],
                 "coordinate_output_bytes": (
                     coordinate_out.stat().st_size
                     if coordinate_out.exists()
