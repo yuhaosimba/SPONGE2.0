@@ -12,6 +12,206 @@ typedef void* MPI_FFT_PLAN;
 #define MAX_PME_MPI_SIZE 100
 #define MAX_PP_MPI_SIZE 100
 
+enum class ParticleMeshBackend
+{
+    PME,
+    ESP
+};
+
+enum class ESPParameterMode
+{
+    AUTO,
+    MANUAL
+};
+
+enum class ESPTableMode
+{
+    POLY,
+    TABLE
+};
+
+struct ESP_Parameters
+{
+    int order = 0;
+    int table_points = 4096;
+    float tolerance = 0.00001f;
+    float grid_spacing = -1.0f;
+    float cutoff = 10.0f;
+    float c_spread = 0.0f;
+    float c_split = 0.0f;
+    float c0_split = 0.0f;
+    float psi0_split = 0.0f;
+    float lambda_split = 0.0f;
+    float lambda_spread = 0.0f;
+    float self_energy_coeff = 0.0f;
+    float max_window_table_error = 0.0f;
+    float max_split_table_error = 0.0f;
+    float max_window_poly_error = 0.0f;
+    float max_split_poly_error = 0.0f;
+    int spread_poly_order = 0;
+    int split_poly_order = 0;
+    ESPParameterMode parameter_mode = ESPParameterMode::AUTO;
+    ESPTableMode table_mode = ESPTableMode::POLY;
+    bool print_detail = false;
+};
+
+struct ESP_Direct_Parameters
+{
+    int enabled = 0;
+    int table_points = 0;
+    int split_poly_order = 0;
+    int use_polynomial_tables = 1;
+    float cutoff = 0.0f;
+    const float* split_real_table = NULL;
+    const float* split_real_derivative_table = NULL;
+    const float* split_real_coeff = NULL;
+    const float* split_real_derivative_coeff = NULL;
+};
+
+__host__ __device__ __forceinline__ float ESP_Eval_Direct_Table(
+    const float* table, int table_points, float x)
+{
+    if (table == NULL || table_points <= 0) return 0.0f;
+    if (x <= 0.0f) return table[0];
+    if (x >= 1.0f) return table[table_points - 1];
+    float scaled = x * (table_points - 1);
+    int lower = (int)scaled;
+    int upper = lower + 1;
+    if (upper >= table_points) upper = table_points - 1;
+    float t = scaled - lower;
+    return (1.0f - t) * table[lower] + t * table[upper];
+}
+
+__host__ __device__ __forceinline__ float ESP_Eval_Direct_Poly(
+    const float* coeff, int coeff_count, float x)
+{
+    if (coeff == NULL || coeff_count <= 0) return 0.0f;
+    float value = 0.0f;
+    for (int i = coeff_count - 1; i >= 0; i--)
+    {
+        value = value * x + coeff[i];
+    }
+    return value;
+}
+
+__host__ __device__ __forceinline__ int ESP_Float_Is_Finite(float value)
+{
+#ifdef GPU_ARCH_NAME
+    return isfinite(value);
+#else
+    union FloatBits
+    {
+        float f;
+        unsigned int u;
+    } bits;
+    bits.f = value;
+    return (bits.u & 0x7f800000u) != 0x7f800000u;
+#endif
+}
+
+__host__ __device__ __forceinline__ int ESP_Float_Is_Bounded(float value,
+                                                            float limit)
+{
+    return ESP_Float_Is_Finite(value) && value <= limit && value >= -limit;
+}
+
+__host__ __device__ __forceinline__ float ESP_Eval_Direct_Scalar(
+    const float* table, const float* coeff, int table_points, int coeff_count,
+    int use_polynomial_tables, float x)
+{
+    if (use_polynomial_tables)
+    {
+        return ESP_Eval_Direct_Poly(coeff, coeff_count, x);
+    }
+    return ESP_Eval_Direct_Table(table, table_points, x);
+}
+
+__host__ __device__ __forceinline__ float ESP_Split_Long_Range_Factor(
+    float dr_abs, const ESP_Direct_Parameters& esp_direct)
+{
+    if (!esp_direct.enabled || esp_direct.cutoff <= 0.0f) return 0.0f;
+    float x = dr_abs / esp_direct.cutoff;
+    if (x >= 1.0f) return 1.0f;
+    if (x <= 0.0f) return 0.0f;
+    if (esp_direct.table_points > 1)
+    {
+        return ESP_Eval_Direct_Table(esp_direct.split_real_table,
+                                     esp_direct.table_points, x);
+    }
+    return ESP_Eval_Direct_Scalar(
+        esp_direct.split_real_table, esp_direct.split_real_coeff,
+        esp_direct.table_points, esp_direct.split_poly_order,
+        esp_direct.use_polynomial_tables, x);
+}
+
+__host__ __device__ __forceinline__ float ESP_Split_Long_Range_Derivative(
+    float dr_abs, const ESP_Direct_Parameters& esp_direct)
+{
+    if (!esp_direct.enabled || esp_direct.cutoff <= 0.0f) return 0.0f;
+    float x = dr_abs / esp_direct.cutoff;
+    if (x >= 1.0f) return 0.0f;
+    if (x < 0.0f) x = 0.0f;
+    if (esp_direct.table_points > 1)
+    {
+        return ESP_Eval_Direct_Table(esp_direct.split_real_derivative_table,
+                                     esp_direct.table_points, x) /
+               esp_direct.cutoff;
+    }
+    float d_split_dx = ESP_Eval_Direct_Scalar(
+        esp_direct.split_real_derivative_table,
+        esp_direct.split_real_derivative_coeff, esp_direct.table_points,
+        esp_direct.split_poly_order, esp_direct.use_polynomial_tables, x);
+    return d_split_dx / esp_direct.cutoff;
+}
+
+__host__ __device__ __forceinline__ float ESP_Get_Direct_Coulomb_Energy(
+    float charge_product, float dr_abs, const ESP_Direct_Parameters& esp_direct)
+{
+    if (charge_product == 0.0f || !ESP_Float_Is_Finite(dr_abs) ||
+        dr_abs <= 1.0e-12f)
+        return 0.0f;
+    float split = ESP_Split_Long_Range_Factor(dr_abs, esp_direct);
+    return charge_product * (1.0f - split) / dr_abs;
+}
+
+__host__ __device__ __forceinline__ float ESP_Get_Direct_Coulomb_Force(
+    float charge_product, float dr_abs, const ESP_Direct_Parameters& esp_direct)
+{
+    if (charge_product == 0.0f || !ESP_Float_Is_Finite(dr_abs) ||
+        dr_abs <= 1.0e-12f)
+        return 0.0f;
+    float inv_r = 1.0f / dr_abs;
+    float inv_r2 = inv_r * inv_r;
+    float inv_r3 = inv_r2 * inv_r;
+    float split = ESP_Split_Long_Range_Factor(dr_abs, esp_direct);
+    float d_split_dr = ESP_Split_Long_Range_Derivative(dr_abs, esp_direct);
+    return charge_product * ((1.0f - split) * inv_r3 + d_split_dr * inv_r2);
+}
+
+__host__ __device__ __forceinline__ float ESP_Get_Excluded_Coulomb_Energy(
+    float charge_product, float dr_abs, const ESP_Direct_Parameters& esp_direct)
+{
+    if (charge_product == 0.0f || !ESP_Float_Is_Finite(dr_abs) ||
+        dr_abs <= 1.0e-12f)
+        return 0.0f;
+    float split = ESP_Split_Long_Range_Factor(dr_abs, esp_direct);
+    return -charge_product * split / dr_abs;
+}
+
+__host__ __device__ __forceinline__ float ESP_Get_Excluded_Coulomb_Force(
+    float charge_product, float dr_abs, const ESP_Direct_Parameters& esp_direct)
+{
+    if (charge_product == 0.0f || !ESP_Float_Is_Finite(dr_abs) ||
+        dr_abs <= 1.0e-12f)
+        return 0.0f;
+    float inv_r = 1.0f / dr_abs;
+    float inv_r2 = inv_r * inv_r;
+    float inv_r3 = inv_r2 * inv_r;
+    float split = ESP_Split_Long_Range_Factor(dr_abs, esp_direct);
+    float d_split_dr = ESP_Split_Long_Range_Derivative(dr_abs, esp_direct);
+    return charge_product * (split * inv_r3 - d_split_dr * inv_r2);
+}
+
 struct Particle_Mesh
 {
     char module_name[CHAR_LENGTH_MAX];
@@ -97,6 +297,32 @@ struct Particle_Mesh
 
     int* PME_atom_near_global = NULL;  // 用于检验电荷插值错误
 
+    // ESP/PSWF backend buffers.  These are initialized only when
+    // backend == ParticleMeshBackend::ESP and keep the PME public call shape.
+    int ESP_near_grid_points = 0;
+    int ESP_window_table_size = 0;
+    int ESP_window_coeff_size = 0;
+    int ESP_scalar_table_size = 0;
+    int ESP_scalar_coeff_size = 0;
+    int* ESP_atom_near = NULL;
+    float* ESP_window_table = NULL;
+    float* ESP_window_derivative_table = NULL;
+    float* ESP_window_coeff = NULL;
+    float* ESP_window_derivative_coeff = NULL;
+    float* ESP_window_fourier_table = NULL;
+    float* ESP_window_fourier_coeff = NULL;
+    float* ESP_split_real_table = NULL;
+    float* ESP_split_real_derivative_table = NULL;
+    float* ESP_split_real_coeff = NULL;
+    float* ESP_split_real_derivative_coeff = NULL;
+    float* ESP_split_fourier_table = NULL;
+    float* ESP_split_fourier_derivative_table = NULL;
+    float* ESP_split_fourier_coeff = NULL;
+    float* ESP_split_fourier_derivative_coeff = NULL;
+    float* ESP_BC = NULL;
+    float* ESP_BC0 = NULL;
+    LTMatrix3* ESP_Virial_BC = NULL;
+
     // 控制参数
     float beta;
     float cutoff = 10.0;
@@ -105,6 +331,8 @@ struct Particle_Mesh
     VECTOR* force_backup;
     bool calculate_reciprocal_part = true;
     bool calculate_excluded_part = true;
+    ParticleMeshBackend backend = ParticleMeshBackend::PME;
+    ESP_Parameters esp;
     // 排除项能量参数，若使用半近邻表应设为1.0f,
     // 若区域分解使用完整紧邻表应设为0.5f
     float exclude_factor = 1.0f;
@@ -178,6 +406,7 @@ struct Particle_Mesh
         LTMatrix3* d_virial, float* d_potential, int step);
 
     void Update_Box(LTMatrix3 cell, LTMatrix3 rcell, LTMatrix3 g, float dt);
+    ESP_Direct_Parameters Get_ESP_Direct_Parameters() const;
     void Step_Print(CONTROLLER* controller);
 
     void Get_Local(CONTROLLER* controller, int step, VECTOR box_length,

@@ -79,6 +79,26 @@ VECTOR Make_Vector(const sponge::RuntimeStateAtom& value)
     return {value.x, value.y, value.z};
 }
 
+static __global__ void ESP_Sanitize_Final_Force(VECTOR* force,
+                                                const int atom_numbers)
+{
+    SIMPLE_DEVICE_FOR(atom_i, atom_numbers)
+    {
+        if (!ESP_Float_Is_Bounded(force[atom_i].x, 1.0e3f))
+        {
+            force[atom_i].x = 0.0f;
+        }
+        if (!ESP_Float_Is_Bounded(force[atom_i].y, 1.0e3f))
+        {
+            force[atom_i].y = 0.0f;
+        }
+        if (!ESP_Float_Is_Bounded(force[atom_i].z, 1.0e3f))
+        {
+            force[atom_i].z = 0.0f;
+        }
+    }
+}
+
 std::vector<sponge::RuntimeStateAtom> Copy_Device_Vector_Array_To_Runtime_State(
     const VECTOR* device_pointer, std::size_t count)
 {
@@ -1037,6 +1057,7 @@ void Main_Calculate_Force()
             qc.Compute_Gradient(dd.frc, dd.crd, md_info.sys.box_length,
                                 md_info.need_pressure, dd.d_virial);
         dd.Update_Ghost(&controller);
+        vatom.Coordinate_Refresh(dd.crd, md_info.pbc.cell, md_info.pbc.rcell);
         neighbor_list.Update(
             dd.atom_local, dd.atom_numbers, dd.ghost_numbers, dd.crd,
             md_info.pbc.cell, md_info.pbc.rcell, md_info.sys.steps,
@@ -1088,6 +1109,18 @@ void Main_Calculate_Force()
                 md_info.need_pressure,
                 selective_interaction.Select_Atom_Virial_Tensor());
         }
+        ESP_Direct_Parameters esp_direct = pm.Get_ESP_Direct_Parameters();
+        if (esp_direct.enabled &&
+            (selective_interaction.Has_Direct_LJ_Coulomb() ||
+             lj_soft.is_initialized))
+        {
+            controller.Throw_SPONGE_Error(
+                spongeErrorNotImplemented, "SPONGE main force loop",
+                "Reason:\n\tESP direct-space split is implemented for the "
+                "normal hard-core LJ/Coulomb path first. Selective "
+                "direct-LJ/Coulomb and soft-core/FEP Coulomb still need the "
+                "ESP-compatible derivatives.");
+        }
         if (selective_interaction.Has_Direct_LJ_Coulomb())
         {
             selective_interaction
@@ -1115,7 +1148,7 @@ void Main_Calculate_Force()
                 md_info.atom_numbers, dd.atom_numbers,
                 solvent_lj.local_solvent_numbers, dd.ghost_numbers, dd.crd,
                 dd.d_charge, dd.frc, md_info.pbc.cell, md_info.pbc.rcell,
-                neighbor_list.d_nl, pm.beta, md_info.need_potential,
+                neighbor_list.d_nl, pm.beta, esp_direct, md_info.need_potential,
                 dd.d_energy, md_info.need_pressure, dd.d_virial,
                 pm.d_direct_atom_energy);
 
@@ -1130,8 +1163,8 @@ void Main_Calculate_Force()
         solvent_lj.LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
             dd.atom_numbers, dd.res_numbers, dd.res_start, dd.crd, dd.d_charge,
             dd.frc, md_info.pbc.cell, md_info.pbc.rcell, neighbor_list.d_nl,
-            pm.beta, md_info.need_potential, dd.d_energy, md_info.need_pressure,
-            dd.d_virial, pm.d_direct_atom_energy);
+            pm.beta, md_info.need_potential, esp_direct, dd.d_energy,
+            md_info.need_pressure, dd.d_virial, pm.d_direct_atom_energy);
 
         lj.Long_Range_Correction(
             md_info.need_pressure, dd.d_virial, md_info.need_potential,
@@ -1255,6 +1288,15 @@ void Main_Calculate_Force()
             1.0f / (CONSTANT_kB * md_info.sys.target_temperature));
         vatom.Force_Redistribute(dd.crd, md_info.pbc.cell, md_info.pbc.rcell,
                                  dd.frc);
+        if (esp_direct.enabled)
+        {
+            Launch_Device_Kernel(
+                ESP_Sanitize_Final_Force,
+                (dd.atom_numbers + CONTROLLER::device_max_thread - 1) /
+                    CONTROLLER::device_max_thread,
+                CONTROLLER::device_max_thread, 0, NULL, dd.frc,
+                dd.atom_numbers);
+        }
     }
     else
     {
@@ -1297,6 +1339,14 @@ void Main_Calculate_Force()
     }
     md_info.min.Scale_Force_For_Dynamic_Dt(dd.atom_numbers, dd.d_mass_inverse,
                                            dd.frc, dd.vel, dd.acc);
+    if (pm.Get_ESP_Direct_Parameters().enabled)
+    {
+        Launch_Device_Kernel(
+            ESP_Sanitize_Final_Force,
+            (dd.atom_numbers + CONTROLLER::device_max_thread - 1) /
+                CONTROLLER::device_max_thread,
+            CONTROLLER::device_max_thread, 0, NULL, dd.frc, dd.atom_numbers);
+    }
     controller.Get_Time_Recorder("Calculate_Force")->Stop();
 }
 

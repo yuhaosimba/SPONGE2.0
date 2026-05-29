@@ -1,4 +1,9 @@
 ﻿#include "PM_force.h"
+
+#include <exception>
+
+#include "esp_pswf.h"
+
 /*
     2025-10-14 SPONGE Particle Mesh算法
     目前支持单进程Particle-Mesh-Ewald 与 PMC-IZ
@@ -288,6 +293,385 @@ static __global__ void charge_square_kernel(int element_number,
     }
 }
 
+static const char* Particle_Mesh_Backend_Name(ParticleMeshBackend backend)
+{
+    switch (backend)
+    {
+        case ParticleMeshBackend::ESP:
+            return "esp";
+        case ParticleMeshBackend::PME:
+        default:
+            return "pme";
+    }
+}
+
+static const char* ESP_Parameter_Mode_Name(ESPParameterMode mode)
+{
+    switch (mode)
+    {
+        case ESPParameterMode::MANUAL:
+            return "manual";
+        case ESPParameterMode::AUTO:
+        default:
+            return "auto";
+    }
+}
+
+static const char* ESP_Table_Mode_Name(ESPTableMode mode)
+{
+    switch (mode)
+    {
+        case ESPTableMode::TABLE:
+            return "table";
+        case ESPTableMode::POLY:
+        default:
+            return "poly";
+    }
+}
+
+static void Parse_ESP_Parameters(CONTROLLER* controller,
+                                 const char* module_name, ESP_Parameters* esp,
+                                 float tolerance, float cutoff)
+{
+    esp->tolerance = tolerance;
+    esp->cutoff = cutoff;
+
+    if (controller->Command_Exist(module_name, "esp_tolerance"))
+    {
+        controller->Check_Float(module_name, "esp_tolerance",
+                                "Particle_Mesh::Initial");
+        esp->tolerance =
+            atof(controller->Command(module_name, "esp_tolerance"));
+        if (esp->tolerance <= 0.0f)
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tesp_tolerance should be positive.");
+        }
+    }
+    if (controller->Command_Exist(module_name, "esp_order"))
+    {
+        controller->Check_Int(module_name, "esp_order",
+                              "Particle_Mesh::Initial");
+        esp->order = atoi(controller->Command(module_name, "esp_order"));
+        if (esp->order <= 0)
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tesp_order should be positive.");
+        }
+    }
+    if (controller->Command_Exist(module_name, "esp_grid_spacing"))
+    {
+        controller->Check_Float(module_name, "esp_grid_spacing",
+                                "Particle_Mesh::Initial");
+        esp->grid_spacing =
+            atof(controller->Command(module_name, "esp_grid_spacing"));
+        if (esp->grid_spacing <= 0.0f)
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tesp_grid_spacing should be positive.");
+        }
+    }
+    if (controller->Command_Exist(module_name, "esp_table_points"))
+    {
+        controller->Check_Int(module_name, "esp_table_points",
+                              "Particle_Mesh::Initial");
+        esp->table_points =
+            atoi(controller->Command(module_name, "esp_table_points"));
+        if (esp->table_points < 2)
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tesp_table_points should be at least 2.");
+        }
+    }
+    if (controller->Command_Exist(module_name, "esp_parameter_mode"))
+    {
+        const char* mode =
+            controller->Command(module_name, "esp_parameter_mode");
+        if (is_str_equal(mode, "auto"))
+        {
+            esp->parameter_mode = ESPParameterMode::AUTO;
+        }
+        else if (is_str_equal(mode, "manual"))
+        {
+            esp->parameter_mode = ESPParameterMode::MANUAL;
+        }
+        else
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tesp_parameter_mode should be 'auto' or 'manual'.");
+        }
+    }
+    if (controller->Command_Exist(module_name, "esp_table_mode"))
+    {
+        const char* mode = controller->Command(module_name, "esp_table_mode");
+        if (is_str_equal(mode, "poly"))
+        {
+            esp->table_mode = ESPTableMode::POLY;
+        }
+        else if (is_str_equal(mode, "table"))
+        {
+            esp->table_mode = ESPTableMode::TABLE;
+        }
+        else
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tesp_table_mode should be 'poly' or 'table'.");
+        }
+    }
+    if (controller->Command_Exist(module_name, "esp_print_detail"))
+    {
+        esp->print_detail = controller->Get_Bool(
+            module_name, "esp_print_detail", "Particle_Mesh::Initial");
+    }
+}
+
+static void ESP_Upload_Float_Vector(float** device_ptr,
+                                    const std::vector<float>& values)
+{
+    if (values.empty()) return;
+    Device_Malloc_And_Copy_Safely((void**)device_ptr, (void*)values.data(),
+                                  sizeof(float) * values.size());
+}
+
+static void Allocate_ESP_PSWF_Buffers(Particle_Mesh* pme,
+                                      const ESP_PSWF_Table& pswf_table)
+{
+    pme->ESP_near_grid_points =
+        pswf_table.order * pswf_table.order * pswf_table.order;
+    pme->ESP_window_table_size = pswf_table.order * pswf_table.table_points;
+    pme->ESP_window_coeff_size =
+        pswf_table.order * pswf_table.spread_poly_order;
+    pme->ESP_scalar_table_size = pswf_table.table_points;
+    pme->ESP_scalar_coeff_size = pswf_table.split_poly_order;
+
+    Device_Malloc_Safely(
+        (void**)&pme->ESP_atom_near,
+        sizeof(int) * pme->ESP_near_grid_points * pme->atom_numbers);
+    deviceMemset(pme->ESP_atom_near, 0,
+                 sizeof(int) * pme->ESP_near_grid_points * pme->atom_numbers);
+
+    ESP_Upload_Float_Vector(&pme->ESP_window_table,
+                            pswf_table.spread_window_table);
+    ESP_Upload_Float_Vector(&pme->ESP_window_derivative_table,
+                            pswf_table.spread_window_derivative_table);
+    ESP_Upload_Float_Vector(&pme->ESP_window_coeff,
+                            pswf_table.spread_window_coeff);
+    ESP_Upload_Float_Vector(&pme->ESP_window_derivative_coeff,
+                            pswf_table.spread_window_derivative_coeff);
+    ESP_Upload_Float_Vector(&pme->ESP_window_fourier_table,
+                            pswf_table.spread_window_fourier_table);
+    ESP_Upload_Float_Vector(&pme->ESP_window_fourier_coeff,
+                            pswf_table.spread_window_fourier_coeff);
+    ESP_Upload_Float_Vector(&pme->ESP_split_real_table,
+                            pswf_table.split_real_table);
+    ESP_Upload_Float_Vector(&pme->ESP_split_real_derivative_table,
+                            pswf_table.split_real_derivative_table);
+    ESP_Upload_Float_Vector(&pme->ESP_split_real_coeff,
+                            pswf_table.split_real_coeff);
+    ESP_Upload_Float_Vector(&pme->ESP_split_real_derivative_coeff,
+                            pswf_table.split_real_derivative_coeff);
+    ESP_Upload_Float_Vector(&pme->ESP_split_fourier_table,
+                            pswf_table.split_fourier_table);
+    ESP_Upload_Float_Vector(&pme->ESP_split_fourier_derivative_table,
+                            pswf_table.split_fourier_derivative_table);
+    ESP_Upload_Float_Vector(&pme->ESP_split_fourier_coeff,
+                            pswf_table.split_fourier_coeff);
+    ESP_Upload_Float_Vector(&pme->ESP_split_fourier_derivative_coeff,
+                            pswf_table.split_fourier_derivative_coeff);
+}
+
+static float ESP_Eval_Host_Table(const std::vector<float>& table, float x)
+{
+    if (table.empty()) return 0.0f;
+    if (x <= 0.0f) return table.front();
+    if (x >= 1.0f) return table.back();
+    float scaled = x * (table.size() - 1);
+    int lower = (int)scaled;
+    int upper = lower + 1;
+    if (upper >= (int)table.size()) upper = table.size() - 1;
+    float t = scaled - lower;
+    return (1.0f - t) * table[lower] + t * table[upper];
+}
+
+static float ESP_Eval_Host_Poly(const std::vector<float>& coeff, float x)
+{
+    float y = 0.0f;
+    for (int i = (int)coeff.size() - 1; i >= 0; i--)
+    {
+        y = y * x + coeff[i];
+    }
+    return y;
+}
+
+static float ESP_Eval_Host_Scalar(const std::vector<float>& table,
+                                  const std::vector<float>& coeff,
+                                  ESPTableMode table_mode, float x)
+{
+    if (x > 1.0f) return 0.0f;
+    if (table_mode == ESPTableMode::POLY)
+    {
+        return ESP_Eval_Host_Poly(coeff, x);
+    }
+    return ESP_Eval_Host_Table(table, x);
+}
+
+static float ESP_Signed_Grid_Mode(int index, int n)
+{
+    float mode = index;
+    if (index > n / 2) mode = index - n;
+    return mode;
+}
+
+static float ESP_Spread_Fourier_Modulus(const ESP_PSWF_Table& pswf_table,
+                                        ESPTableMode table_mode, int index,
+                                        int n)
+{
+    float mode = fabsf(ESP_Signed_Grid_Mode(index, n));
+    float arg =
+        CONSTANT_Pi * pswf_table.order * mode / (n * pswf_table.c_spread);
+    if (arg > 1.0f) return 1.0e30f;
+    float window = ESP_Eval_Host_Scalar(pswf_table.spread_window_fourier_table,
+                                        pswf_table.spread_window_fourier_coeff,
+                                        table_mode, arg);
+    float modulus = window * window;
+    if (modulus < 1.0e-30f) modulus = 1.0e-30f;
+    return modulus;
+}
+
+static void Build_ESP_BC(CONTROLLER* controller, Particle_Mesh* pme,
+                         const ESP_PSWF_Table& pswf_table, LTMatrix3 rcell,
+                         float volume)
+{
+    float* h_ESP_BC = (float*)malloc(sizeof(float) * pme->PME_Nfft);
+    float* h_ESP_BC0 = (float*)malloc(sizeof(float) * pme->PME_Nfft);
+    LTMatrix3* h_ESP_virial_BC =
+        (LTMatrix3*)malloc(sizeof(LTMatrix3) * pme->PME_Nfft);
+    if (h_ESP_BC == NULL || h_ESP_BC0 == NULL || h_ESP_virial_BC == NULL)
+    {
+        controller->Throw_SPONGE_Error(
+            spongeErrorMallocFailed, "Build_ESP_BC",
+            "Reason:\n\tError occurs when malloc ESP_BC.");
+    }
+
+    std::vector<float> mod_x(pme->fftx);
+    std::vector<float> mod_y(pme->ffty);
+    std::vector<float> mod_z(pme->fftz);
+    for (int i = 0; i < pme->fftx; i++)
+    {
+        mod_x[i] = ESP_Spread_Fourier_Modulus(pswf_table, pme->esp.table_mode,
+                                              i, pme->fftx);
+    }
+    for (int i = 0; i < pme->ffty; i++)
+    {
+        mod_y[i] = ESP_Spread_Fourier_Modulus(pswf_table, pme->esp.table_mode,
+                                              i, pme->ffty);
+    }
+    for (int i = 0; i < pme->fftz; i++)
+    {
+        mod_z[i] = ESP_Spread_Fourier_Modulus(pswf_table, pme->esp.table_mode,
+                                              i, pme->fftz);
+    }
+
+    const float half_order = 0.5f * pswf_table.order;
+    const float support_scale = half_order * half_order * half_order *
+                                half_order * half_order * half_order;
+    const float split_scale =
+        2.0f * CONSTANT_Pi * pswf_table.cutoff / pswf_table.c_split;
+
+    for (int kx = 0; kx < pme->fftx; kx++)
+    {
+        float kxrp = ESP_Signed_Grid_Mode(kx, pme->fftx);
+        for (int ky = 0; ky < pme->ffty; ky++)
+        {
+            float kyrp = ESP_Signed_Grid_Mode(ky, pme->ffty);
+            for (int kz = 0; kz <= pme->fftz / 2; kz++)
+            {
+                float kzrp = kz;
+                int index = kx * pme->ffty * (pme->fftz / 2 + 1) +
+                            ky * (pme->fftz / 2 + 1) + kz;
+                VECTOR m = {kxrp, kyrp, kzrp};
+                m = MultiplyTranspose(m, rcell);
+                float msq = m * m;
+                h_ESP_BC[index] = 0.0f;
+                h_ESP_BC0[index] = 0.0f;
+                h_ESP_virial_BC[index] = {0, 0, 0, 0, 0, 0};
+                if (kx + ky + kz == 0 || msq <= 0.0f)
+                {
+                    continue;
+                }
+
+                float split_arg = split_scale * sqrtf(msq);
+                if (split_arg > 1.0f)
+                {
+                    continue;
+                }
+                float split_fourier =
+                    0.5f * ESP_Eval_Host_Scalar(pswf_table.split_fourier_table,
+                                                pswf_table.split_fourier_coeff,
+                                                pme->esp.table_mode, split_arg);
+                float split_fourier_derivative =
+                    0.5f * ESP_Eval_Host_Scalar(
+                               pswf_table.split_fourier_derivative_table,
+                               pswf_table.split_fourier_derivative_coeff,
+                               pme->esp.table_mode, split_arg);
+                float deconvolution =
+                    1.0f / (mod_x[kx] * mod_y[ky] * mod_z[kz] * support_scale);
+            if (!ESP_Float_Is_Bounded(deconvolution, 1.0e12f))
+                {
+                    continue;
+                }
+                float bc = split_fourier * deconvolution /
+                           (CONSTANT_Pi * msq * volume);
+            if (!ESP_Float_Is_Bounded(bc, 1.0e6f))
+                {
+                    continue;
+                }
+                h_ESP_BC0[index] = deconvolution;
+                h_ESP_BC[index] = bc;
+
+                float derivative_ratio = 0.0f;
+                if (fabsf(split_fourier) > 1.0e-30f)
+                {
+                    derivative_ratio = split_fourier_derivative / split_fourier;
+                }
+                float metric_factor = (2.0f - derivative_ratio) / msq;
+                h_ESP_virial_BC[index].a11 =
+                    0.5f * bc * (1.0f - metric_factor * m.x * m.x);
+                h_ESP_virial_BC[index].a21 =
+                    0.5f * bc * (0.0f - metric_factor * m.y * m.x);
+                h_ESP_virial_BC[index].a22 =
+                    0.5f * bc * (1.0f - metric_factor * m.y * m.y);
+                h_ESP_virial_BC[index].a31 =
+                    0.5f * bc * (0.0f - metric_factor * m.z * m.x);
+                h_ESP_virial_BC[index].a32 =
+                    0.5f * bc * (0.0f - metric_factor * m.z * m.y);
+                h_ESP_virial_BC[index].a33 =
+                    0.5f * bc * (1.0f - metric_factor * m.z * m.z);
+            }
+        }
+    }
+
+    Device_Malloc_Safely((void**)&pme->ESP_BC, sizeof(float) * pme->PME_Nfft);
+    Device_Malloc_Safely((void**)&pme->ESP_BC0, sizeof(float) * pme->PME_Nfft);
+    Device_Malloc_Safely((void**)&pme->ESP_Virial_BC,
+                         sizeof(LTMatrix3) * pme->PME_Nfft);
+    deviceMemcpy(pme->ESP_BC, h_ESP_BC, sizeof(float) * pme->PME_Nfft,
+                 deviceMemcpyHostToDevice);
+    deviceMemcpy(pme->ESP_BC0, h_ESP_BC0, sizeof(float) * pme->PME_Nfft,
+                 deviceMemcpyHostToDevice);
+    deviceMemcpy(pme->ESP_Virial_BC, h_ESP_virial_BC,
+                 sizeof(LTMatrix3) * pme->PME_Nfft, deviceMemcpyHostToDevice);
+    free(h_ESP_BC);
+    free(h_ESP_BC0);
+    free(h_ESP_virial_BC);
+}
+
 //--------Particle Mesh Ewald Method----------
 
 void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
@@ -318,6 +702,31 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
         tolerance =
             atof(controller->Command(this->module_name, "Direct_Tolerance"));
     }
+
+    backend = ParticleMeshBackend::PME;
+    if (controller->Command_Exist(this->module_name, "backend"))
+    {
+        const char* backend_name =
+            controller->Command(this->module_name, "backend");
+        if (is_str_equal(backend_name, "pme"))
+        {
+            backend = ParticleMeshBackend::PME;
+        }
+        else if (is_str_equal(backend_name, "esp"))
+        {
+            backend = ParticleMeshBackend::ESP;
+        }
+        else
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorValueErrorCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tPM backend should be 'pme' or 'esp'.");
+        }
+    }
+    Parse_ESP_Parameters(controller, this->module_name, &esp, tolerance,
+                         cutoff);
+    controller->printf("    particle mesh backend: %s\n",
+                       Particle_Mesh_Backend_Name(backend));
 
     if (CONTROLLER::PP_MPI_size == 1)
     {
@@ -387,6 +796,10 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
                                 "Particle_Mesh::Initial");
         grid_spacing =
             atof(controller->Command(this->module_name, "grid_spacing"));
+    }
+    if (backend == ParticleMeshBackend::ESP && esp.grid_spacing > 0.0f)
+    {
+        grid_spacing = esp.grid_spacing;
     }
     controller->printf("    grid_spacing: %f Angstrom\n", grid_spacing);
     if (fftx < 0) fftx = Get_Fft_Patameter(box_length.x / grid_spacing);
@@ -497,6 +910,100 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
     {
         use_pmc_iz = controller->Get_Bool("PME", "replaced_by_PMC_IZ",
                                           "Particle_Mesh::Initial");
+    }
+    if (backend == ParticleMeshBackend::ESP)
+    {
+        neutralizing_factor = 0.0f;
+        if (PM_MPI_size > 1)
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorNotImplemented, "Particle_Mesh::Initial",
+                "Reason:\n\tESP does not support multi-process PME yet.");
+        }
+        if (use_pmc_iz)
+        {
+            controller->Throw_SPONGE_Error(
+                spongeErrorConflictingCommand, "Particle_Mesh::Initial",
+                "Reason:\n\tPM backend 'esp' conflicts with "
+                "PME.replaced_by_PMC_IZ.");
+        }
+        controller->printf("    ESP tolerance: %e\n", esp.tolerance);
+        controller->printf("    ESP order: %d\n", esp.order);
+        controller->printf("    ESP parameter mode: %s\n",
+                           ESP_Parameter_Mode_Name(esp.parameter_mode));
+        controller->printf("    ESP table mode: %s\n",
+                           ESP_Table_Mode_Name(esp.table_mode));
+        controller->printf("    ESP table points: %d\n", esp.table_points);
+        if (esp.grid_spacing > 0.0f)
+        {
+            controller->printf("    ESP grid_spacing override: %f Angstrom\n",
+                               esp.grid_spacing);
+        }
+        ESP_PSWF_Table esp_pswf;
+        try
+        {
+            esp_pswf = Build_ESP_PSWF_Table(esp);
+        }
+        catch (const std::exception& e)
+        {
+            controller->Throw_SPONGE_Error(spongeErrorValueErrorCommand,
+                                           "Particle_Mesh::Initial", e.what());
+        }
+        esp.order = esp_pswf.order;
+        esp.table_points = esp_pswf.table_points;
+        esp.c_spread = esp_pswf.c_spread;
+        esp.c_split = esp_pswf.c_split;
+        esp.c0_split = esp_pswf.c0_split;
+        esp.psi0_split = esp_pswf.psi0_split;
+        esp.lambda_split = esp_pswf.lambda_split;
+        esp.lambda_spread = esp_pswf.lambda_spread;
+        esp.self_energy_coeff = esp_pswf.self_energy_coeff;
+        esp.max_window_table_error = esp_pswf.max_window_table_error;
+        esp.max_split_table_error = esp_pswf.max_split_table_error;
+        esp.max_window_poly_error = esp_pswf.max_window_poly_error;
+        esp.max_split_poly_error = esp_pswf.max_split_poly_error;
+        esp.spread_poly_order = esp_pswf.spread_poly_order;
+        esp.split_poly_order = esp_pswf.split_poly_order;
+        Allocate_ESP_PSWF_Buffers(this, esp_pswf);
+        Build_ESP_BC(controller, this, esp_pswf, rcell, volume);
+        controller->printf("    ESP c_spread: %.8e\n", esp.c_spread);
+        controller->printf("    ESP c_split: %.8e\n", esp.c_split);
+        controller->printf("    ESP c0_split: %.8e\n", esp.c0_split);
+        controller->printf("    ESP psi0_split: %.8e\n", esp.psi0_split);
+        controller->printf("    ESP lambda_split: %.8e\n", esp.lambda_split);
+        controller->printf("    ESP lambda_spread: %.8e\n", esp.lambda_spread);
+        controller->printf("    ESP self_energy_coeff: %.8e\n",
+                           esp.self_energy_coeff);
+        controller->printf("    ESP near grid points per atom: %d\n",
+                           ESP_near_grid_points);
+        if (esp.print_detail)
+        {
+            controller->printf("    ESP spread poly order: %d\n",
+                               esp.spread_poly_order);
+            controller->printf("    ESP split poly order: %d\n",
+                               esp.split_poly_order);
+            controller->printf("    ESP window table floats: %d\n",
+                               ESP_window_table_size);
+            controller->printf("    ESP window coeff floats: %d\n",
+                               ESP_window_coeff_size);
+            controller->printf("    ESP scalar table floats: %d\n",
+                               ESP_scalar_table_size);
+            controller->printf("    ESP scalar coeff floats: %d\n",
+                               ESP_scalar_coeff_size);
+            controller->printf("    ESP influence coefficients: %d\n",
+                               PME_Nfft);
+            controller->printf("    ESP window table max error: %.8e\n",
+                               esp.max_window_table_error);
+            controller->printf("    ESP split table max error: %.8e\n",
+                               esp.max_split_table_error);
+            controller->printf("    ESP window poly max error: %.8e\n",
+                               esp.max_window_poly_error);
+            controller->printf("    ESP split poly max error: %.8e\n",
+                               esp.max_split_poly_error);
+        }
+        controller->printf(
+            "    WARNING: ESP backend is experimental; use current validation "
+            "fixtures before production runs.\n");
     }
 
     // 计算B-Spline修正系数 * 泊松算子因子， 用于倒空间乘法
@@ -664,6 +1171,29 @@ void Particle_Mesh::Clear()
         Free_Single_Device_Pointer((void**)&PME_BC);
         Free_Single_Device_Pointer((void**)&PME_Virial_BC);
         Free_Single_Device_Pointer((void**)&PME_BC0);
+        Free_Single_Device_Pointer((void**)&ESP_atom_near);
+        Free_Single_Device_Pointer((void**)&ESP_window_table);
+        Free_Single_Device_Pointer((void**)&ESP_window_derivative_table);
+        Free_Single_Device_Pointer((void**)&ESP_window_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_window_derivative_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_window_fourier_table);
+        Free_Single_Device_Pointer((void**)&ESP_window_fourier_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_split_real_table);
+        Free_Single_Device_Pointer((void**)&ESP_split_real_derivative_table);
+        Free_Single_Device_Pointer((void**)&ESP_split_real_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_split_real_derivative_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_split_fourier_table);
+        Free_Single_Device_Pointer((void**)&ESP_split_fourier_derivative_table);
+        Free_Single_Device_Pointer((void**)&ESP_split_fourier_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_split_fourier_derivative_coeff);
+        Free_Single_Device_Pointer((void**)&ESP_BC);
+        Free_Single_Device_Pointer((void**)&ESP_BC0);
+        Free_Single_Device_Pointer((void**)&ESP_Virial_BC);
+        ESP_near_grid_points = 0;
+        ESP_window_table_size = 0;
+        ESP_window_coeff_size = 0;
+        ESP_scalar_table_size = 0;
+        ESP_scalar_coeff_size = 0;
         Free_Single_Device_Pointer((void**)&charge_sum);
         Free_Single_Device_Pointer((void**)&charge_square);
         Free_Single_Device_Pointer((void**)&num_ghost_dir_id);
@@ -693,6 +1223,21 @@ void Particle_Mesh::Clear()
     }
 }
 
+ESP_Direct_Parameters Particle_Mesh::Get_ESP_Direct_Parameters() const
+{
+    ESP_Direct_Parameters direct;
+    direct.enabled = backend == ParticleMeshBackend::ESP;
+    direct.table_points = esp.table_points;
+    direct.split_poly_order = esp.split_poly_order;
+    direct.use_polynomial_tables = esp.table_mode == ESPTableMode::POLY;
+    direct.cutoff = esp.cutoff;
+    direct.split_real_table = ESP_split_real_table;
+    direct.split_real_derivative_table = ESP_split_real_derivative_table;
+    direct.split_real_coeff = ESP_split_real_coeff;
+    direct.split_real_derivative_coeff = ESP_split_real_derivative_coeff;
+    return direct;
+}
+
 // 计算每个原子所在的网格点以及其周围64个网格点的索引
 __global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
                               const int PME_Nin, const LTMatrix3 cell,
@@ -707,8 +1252,9 @@ __global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
         UNSIGNED_INT_VECTOR* temp_uxyz = &PME_uxyz[atom];
         VECTOR frac_crd = crd[atom] * rcell;
         frac_crd = frac_crd - floorf(frac_crd);
-        if (!isfinite(frac_crd.x) || !isfinite(frac_crd.y) ||
-            !isfinite(frac_crd.z))
+        if (!ESP_Float_Is_Finite(frac_crd.x) ||
+            !ESP_Float_Is_Finite(frac_crd.y) ||
+            !ESP_Float_Is_Finite(frac_crd.z))
         {
             frac_crd = {0.0f, 0.0f, 0.0f};
         }
@@ -822,6 +1368,54 @@ __global__ void PME_BCFQ(FFT_COMPLEX* PME_FQ, float* PME_BC, int PME_Nfft)
     }
 }
 
+static __global__ void ESP_Sanitize_Float_List(float* values,
+                                               const int element_number)
+{
+    SIMPLE_DEVICE_FOR(index, element_number)
+    {
+        if (!ESP_Float_Is_Bounded(values[index], 1.0e4f))
+        {
+            values[index] = 0.0f;
+        }
+    }
+}
+
+static __global__ void ESP_Sanitize_Complex_List(FFT_COMPLEX* values,
+                                                 const int element_number)
+{
+    SIMPLE_DEVICE_FOR(index, element_number)
+    {
+        if (!ESP_Float_Is_Bounded(REAL(values[index]), 1.0e8f))
+        {
+            REAL(values[index]) = 0.0f;
+        }
+        if (!ESP_Float_Is_Bounded(IMAGINARY(values[index]), 1.0e8f))
+        {
+            IMAGINARY(values[index]) = 0.0f;
+        }
+    }
+}
+
+static __global__ void ESP_Sanitize_Vector_List(VECTOR* values,
+                                                const int element_number)
+{
+    SIMPLE_DEVICE_FOR(index, element_number)
+    {
+        if (!ESP_Float_Is_Bounded(values[index].x, 1.0e5f))
+        {
+            values[index].x = 0.0f;
+        }
+        if (!ESP_Float_Is_Bounded(values[index].y, 1.0e5f))
+        {
+            values[index].y = 0.0f;
+        }
+        if (!ESP_Float_Is_Bounded(values[index].z, 1.0e5f))
+        {
+            values[index].z = 0.0f;
+        }
+    }
+}
+
 // 计算每个原子受力
 static __global__ void PME_Final(int* PME_atom_near, const float* charge,
                                  const float* PME_Q, VECTOR* force,
@@ -889,6 +1483,224 @@ static __global__ void PME_Final(int* PME_atom_near, const float* charge,
     }
 }
 
+static __device__ __forceinline__ float ESP_Eval_Table_Window(
+    const float* table, const int table_points, const int window_index, float x)
+{
+    if (x <= 0.0f) return table[window_index * table_points];
+    if (x >= 1.0f) return table[window_index * table_points + table_points - 1];
+    float scaled = x * (table_points - 1);
+    int lower = (int)scaled;
+    int upper = lower + 1;
+    if (upper >= table_points) upper = table_points - 1;
+    float t = scaled - lower;
+    int offset = window_index * table_points;
+    return (1.0f - t) * table[offset + lower] + t * table[offset + upper];
+}
+
+static __device__ __forceinline__ float ESP_Eval_Poly_Window(
+    const float* coeff, const int poly_order, const int window_index, float x)
+{
+    int offset = window_index * poly_order;
+    float y = 0.0f;
+    for (int i = poly_order - 1; i >= 0; i--)
+    {
+        y = y * x + coeff[offset + i];
+    }
+    return y;
+}
+
+static __device__ __forceinline__ float ESP_Eval_Window(
+    const float* table, const float* coeff, const int table_points,
+    const int poly_order, const int use_poly, const int window_index, float x)
+{
+    if (use_poly)
+    {
+        return ESP_Eval_Poly_Window(coeff, poly_order, window_index, x);
+    }
+    return ESP_Eval_Table_Window(table, table_points, window_index, x);
+}
+
+static __device__ __forceinline__ void ESP_Decompose_Window_Index(
+    int k, int order, int* kx, int* ky, int* kz)
+{
+    int order2 = order * order;
+    *kx = k / order2;
+    *ky = (k - (*kx) * order2) / order;
+    *kz = k - (*kx) * order2 - (*ky) * order;
+}
+
+// ESP动态支持宽度版本：每个原子附近的网格点数为 order^3。
+static __global__ void ESP_Atom_Near(
+    const VECTOR* crd, int* ESP_atom_near, const int PME_Nin,
+    const LTMatrix3 cell, const LTMatrix3 rcell, const int atom_numbers,
+    const int fftx, const int ffty, const int fftz, const int order,
+    UNSIGNED_INT_VECTOR* PME_uxyz, VECTOR* PME_frxyz, VECTOR* force_backup)
+{
+    SIMPLE_DEVICE_FOR(atom, atom_numbers)
+    {
+        force_backup[atom] = {0.0f, 0.0f, 0.0f};
+        UNSIGNED_INT_VECTOR* temp_uxyz = &PME_uxyz[atom];
+        VECTOR frac_crd = crd[atom] * rcell;
+        frac_crd = frac_crd - floorf(frac_crd);
+        if (!ESP_Float_Is_Finite(frac_crd.x) ||
+            !ESP_Float_Is_Finite(frac_crd.y) ||
+            !ESP_Float_Is_Finite(frac_crd.z))
+        {
+            frac_crd = {0.0f, 0.0f, 0.0f};
+        }
+
+        frac_crd.x *= fftx;
+        int tempux = (int)frac_crd.x;
+        tempux = tempux < 0 ? 0 : (tempux < fftx ? tempux : fftx - 1);
+        PME_frxyz[atom].x = frac_crd.x - tempux;
+        PME_frxyz[atom].x = PME_frxyz[atom].x - floorf(PME_frxyz[atom].x);
+
+        frac_crd.y *= ffty;
+        int tempuy = (int)frac_crd.y;
+        tempuy = tempuy < 0 ? 0 : (tempuy < ffty ? tempuy : ffty - 1);
+        PME_frxyz[atom].y = frac_crd.y - tempuy;
+        PME_frxyz[atom].y = PME_frxyz[atom].y - floorf(PME_frxyz[atom].y);
+
+        frac_crd.z *= fftz;
+        int tempuz = (int)frac_crd.z;
+        tempuz = tempuz < 0 ? 0 : (tempuz < fftz ? tempuz : fftz - 1);
+        PME_frxyz[atom].z = frac_crd.z - tempuz;
+        PME_frxyz[atom].z = PME_frxyz[atom].z - floorf(PME_frxyz[atom].z);
+
+        if (tempux != (*temp_uxyz).uint_x || tempuy != (*temp_uxyz).uint_y ||
+            tempuz != (*temp_uxyz).uint_z)
+        {
+            (*temp_uxyz).uint_x = tempux;
+            (*temp_uxyz).uint_y = tempuy;
+            (*temp_uxyz).uint_z = tempuz;
+            int support = order * order * order;
+            int* temp_near = ESP_atom_near + atom * support;
+            for (int k = 0; k < support; k++)
+            {
+                int kx, ky, kz;
+                ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
+
+                kx = tempux - kx;
+                if (kx < 0) kx += fftx;
+                if (kx >= fftx) kx -= fftx;
+
+                ky = tempuy - ky;
+                if (ky < 0) ky += ffty;
+                if (ky >= ffty) ky -= ffty;
+
+                kz = tempuz - kz;
+                if (kz < 0) kz += fftz;
+                if (kz >= fftz) kz -= fftz;
+
+                temp_near[k] = kx * PME_Nin + ky * fftz + kz;
+            }
+        }
+    }
+}
+
+// ESP/PSWF电荷分配：分离变量 W(x)W(y)W(z)，支持poly或table模式。
+static __global__ void ESP_Q_Spread(
+    int* ESP_atom_near, const float* charge, const VECTOR* PME_frxyz,
+    float* PME_Q, const int atom_numbers, const int PME_Nall, const int order,
+    const int support, const int table_points, const int poly_order,
+    const int use_poly, const float* window_table, const float* window_coeff)
+{
+#ifdef USE_GPU
+    SIMPLE_DEVICE_FOR(atom, atom_numbers)
+#else
+    for (int atom = 0; atom < atom_numbers; atom++)
+#endif
+    {
+        int* temp_near = ESP_atom_near + atom * support;
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        float tempcharge = charge[atom];
+#ifdef USE_GPU
+        for (int k = threadIdx.y; k < support; k = k + blockDim.y)
+#else
+        for (int k = 0; k < support; k++)
+#endif
+        {
+            int kx, ky, kz;
+            ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
+            float wx = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                       poly_order, use_poly, kx, temp_frxyz.x);
+            float wy = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                       poly_order, use_poly, ky, temp_frxyz.y);
+            float wz = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                       poly_order, use_poly, kz, temp_frxyz.z);
+            int near_index = temp_near[k];
+            if ((unsigned int)near_index < (unsigned int)PME_Nall)
+            {
+                atomicAdd(&PME_Q[near_index], tempcharge * wx * wy * wz);
+            }
+        }
+    }
+}
+
+// ESP/PSWF gather：使用 dW/dx, dW/dy, dW/dz 得到 reciprocal force。
+static __global__ void ESP_Final(
+    int* ESP_atom_near, const float* charge, const float* PME_Q, VECTOR* force,
+    const VECTOR* PME_frxyz, const LTMatrix3 rcell, const int fftx,
+    const int ffty, const int fftz, const int atom_numbers, const int PME_Nall,
+    const int order, const int support, const int table_points,
+    const int poly_order, const int use_poly, const float* window_table,
+    const float* window_derivative_table, const float* window_coeff,
+    const float* window_derivative_coeff)
+{
+#ifdef GPU_ARCH_NAME
+    int atom = blockDim.y * blockIdx.x + threadIdx.y;
+    if (atom < atom_numbers)
+#else
+#pragma omp parallel for
+    for (int atom = 0; atom < atom_numbers; atom++)
+#endif
+    {
+        int* temp_near = ESP_atom_near + atom * support;
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        float temp_charge = charge[atom];
+        VECTOR tempnv = {0, 0, 0};
+#ifdef USE_GPU
+        for (int k = threadIdx.x; k < support; k = k + blockDim.x)
+#else
+        for (int k = 0; k < support; k++)
+#endif
+        {
+            int near_index = temp_near[k];
+            if ((unsigned int)near_index >= (unsigned int)PME_Nall)
+            {
+                continue;
+            }
+
+            int kx, ky, kz;
+            ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
+            float wx = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                       poly_order, use_poly, kx, temp_frxyz.x);
+            float wy = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                       poly_order, use_poly, ky, temp_frxyz.y);
+            float wz = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                       poly_order, use_poly, kz, temp_frxyz.z);
+            float dwx = ESP_Eval_Window(window_derivative_table,
+                                        window_derivative_coeff, table_points,
+                                        poly_order, use_poly, kx, temp_frxyz.x);
+            float dwy = ESP_Eval_Window(window_derivative_table,
+                                        window_derivative_coeff, table_points,
+                                        poly_order, use_poly, ky, temp_frxyz.y);
+            float dwz = ESP_Eval_Window(window_derivative_table,
+                                        window_derivative_coeff, table_points,
+                                        poly_order, use_poly, kz, temp_frxyz.z);
+
+            float tempdQf = -PME_Q[near_index] * temp_charge;
+            VECTOR tempdQ;
+            tempdQ.x = dwx * wy * wz * fftx;
+            tempdQ.y = dwy * wx * wz * ffty;
+            tempdQ.z = dwz * wx * wy * fftz;
+            tempdQ = tempdQf * MultiplyTranspose(tempdQ, rcell);
+            tempnv = tempnv + tempdQ;
+        }
+        Warp_Sum_To(force + atom, tempnv, 8);
+    }
+}
+
 // sum += list1 * list2
 __global__ void PME_Energy_Product(const int element_number, const float* list1,
                                    const float* list2, float* sum)
@@ -915,12 +1727,51 @@ __global__ void PME_Energy_Product(const int element_number, const float* list1,
     atomicAdd(sum, lin);
 }
 
+static __global__ void ESP_Energy_Product(const int element_number,
+                                          const float* list1,
+                                          const float* list2, float* sum)
+{
+#ifdef USE_GPU
+    if (threadIdx.x == 0)
+    {
+        sum[0] = 0.;
+    }
+    __syncthreads();
+#else
+    sum[0] = 0;
+#endif
+    double lin = 0.0;
+#ifdef USE_GPU
+    for (int i = threadIdx.x; i < element_number; i = i + blockDim.x)
+#else
+#pragma omp parallel for reduction(+ : lin)
+    for (int i = 0; i < element_number; i++)
+#endif
+    {
+        double product = 0.0;
+        if (ESP_Float_Is_Bounded(list1[i], 1.0e6f) &&
+            ESP_Float_Is_Bounded(list2[i], 1.0e6f))
+        {
+            product = static_cast<double>(list1[i]) * list2[i];
+            if (product < 1.0e12 && product > -1.0e12)
+            {
+                lin += product;
+            }
+        }
+    }
+    if (lin > 1.0e20 || lin < -1.0e20)
+    {
+        lin = 0.0;
+    }
+    atomicAdd(sum, static_cast<float>(lin));
+}
+
 static __global__ void PME_Excluded_Force_With_Atom_Energy_Correction(
     const int atom_numbers, const VECTOR* crd, const LTMatrix3 cell,
     const LTMatrix3 rcell, const float* charge, const float pme_beta,
-    const int* excluded_list_start, const int* excluded_list,
-    const int* excluded_atom_numbers, VECTOR* frc, float* atom_ene,
-    float* this_ene, LTMatrix3* atom_virial)
+    const ESP_Direct_Parameters esp_direct, const int* excluded_list_start,
+    const int* excluded_list, const int* excluded_atom_numbers, VECTOR* frc,
+    float* atom_ene, float* this_ene, LTMatrix3* atom_virial)
 {
     SIMPLE_DEVICE_FOR(atom_i, atom_numbers)
     {
@@ -957,14 +1808,30 @@ static __global__ void PME_Excluded_Force_With_Atom_Energy_Correction(
                 // 假设剔除表中的原子对距离总是小于cutoff的，正常体系
 
                 dr_abs = sqrtf(dr2);
-                beta_dr = pme_beta * dr_abs;
-                frc_abs = beta_dr * TWO_DIVIDED_BY_SQRT_PI *
-                              expf(-beta_dr * beta_dr) +
-                          erfcf(beta_dr);
-                frc_abs = (frc_abs - 1.) / dr2 / dr_abs;
-                frc_abs = -charge_i * charge_j * frc_abs;
+                if (esp_direct.enabled)
+                {
+                    frc_abs = ESP_Get_Excluded_Coulomb_Force(
+                        charge_i * charge_j, dr_abs, esp_direct);
+                }
+                else
+                {
+                    beta_dr = pme_beta * dr_abs;
+                    frc_abs = beta_dr * TWO_DIVIDED_BY_SQRT_PI *
+                                  expf(-beta_dr * beta_dr) +
+                              erfcf(beta_dr);
+                    frc_abs = (frc_abs - 1.) / dr2 / dr_abs;
+                    frc_abs = -charge_i * charge_j * frc_abs;
+                }
                 frc_lin = frc_abs * dr;
-                ene_lin -= charge_i * charge_j * erff(beta_dr) / dr_abs;
+                if (esp_direct.enabled)
+                {
+                    ene_lin += ESP_Get_Excluded_Coulomb_Energy(
+                        charge_i * charge_j, dr_abs, esp_direct);
+                }
+                else
+                {
+                    ene_lin -= charge_i * charge_j * erff(beta_dr) / dr_abs;
+                }
                 frc_record = frc_record + frc_lin;
                 atomicAdd(frc + atom_j, -frc_lin);
                 virial_record =
@@ -995,9 +1862,9 @@ void Particle_Mesh::PME_Excluded_Force_With_Atom_Energy(
             (atom_numbers + CONTROLLER::device_max_thread - 1) /
                 CONTROLLER::device_max_thread,
             CONTROLLER::device_max_thread, 0, NULL, atom_numbers, crd, cell,
-            rcell, charge, beta, excluded_list_start, excluded_list,
-            excluded_atom_numbers, frc, atom_ene, d_correction_atom_energy,
-            atom_virial);
+            rcell, charge, beta, Get_ESP_Direct_Parameters(),
+            excluded_list_start, excluded_list, excluded_atom_numbers, frc,
+            atom_ene, d_correction_atom_energy, atom_virial);
     }
 }
 
@@ -1075,6 +1942,131 @@ void Particle_Mesh::PME_Reciprocal_Force_With_Energy_And_Virial(
         {
             deviceMemset(d_reciprocal_ene, 0, sizeof(float));
             deviceMemset(d_self_ene, 0, sizeof(float));
+        }
+        if (backend == ParticleMeshBackend::ESP)
+        {
+            int use_poly = esp.table_mode == ESPTableMode::POLY;
+            if (step % update_interval == 0)
+            {
+                deviceMemset(PME_Q, 0, sizeof(float) * PME_Nall);
+                Launch_Device_Kernel(
+                    ESP_Atom_Near,
+                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, crd, ESP_atom_near,
+                    PME_Nin, cell, rcell, atom_numbers, fftx, ffty, fftz,
+                    esp.order, PME_uxyz, PME_frxyz, force_backup);
+
+                int spread_threads_y = ESP_near_grid_points;
+                if (spread_threads_y > CONTROLLER::device_max_thread)
+                    spread_threads_y = CONTROLLER::device_max_thread;
+                if (spread_threads_y < 1) spread_threads_y = 1;
+                dim3 blockSize = {
+                    CONTROLLER::device_max_thread / spread_threads_y,
+                    (unsigned int)spread_threads_y};
+                if (blockSize.x < 1) blockSize.x = 1;
+                Launch_Device_Kernel(
+                    ESP_Q_Spread,
+                    (atom_numbers + blockSize.x - 1) / blockSize.x, blockSize,
+                    0, NULL, ESP_atom_near, charge, PME_frxyz, PME_Q,
+                    atom_numbers, PME_Nall, esp.order, ESP_near_grid_points,
+                    esp.table_points, esp.spread_poly_order, use_poly,
+                    ESP_window_table, ESP_window_coeff);
+                Launch_Device_Kernel(
+                    ESP_Sanitize_Float_List,
+                    (PME_Nall + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, PME_Q, PME_Nall);
+
+                SPONGE_FFT_WRAPPER::R2C(PME_plan_r2c, PME_Q, PME_FQ);
+                Launch_Device_Kernel(
+                    ESP_Sanitize_Complex_List,
+                    (PME_Nfft + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, PME_FQ, PME_Nfft);
+
+                blockSize = {
+                    CONTROLLER::device_warp,
+                    CONTROLLER::device_max_thread / CONTROLLER::device_warp};
+                if (need_virial)
+                {
+                    Launch_Device_Kernel(
+                        PME_Sum_Virial,
+                        (PME_Nfft + 4 * CONTROLLER::device_max_thread - 1) /
+                            CONTROLLER::device_max_thread,
+                        blockSize, 0, NULL, PME_Nfft, ESP_Virial_BC, PME_FQ,
+                        d_virial, fftz);
+                }
+
+                Launch_Device_Kernel(
+                    PME_BCFQ,
+                    (PME_Nfft + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, PME_FQ, ESP_BC,
+                    PME_Nfft);
+                Launch_Device_Kernel(
+                    ESP_Sanitize_Complex_List,
+                    (PME_Nfft + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, PME_FQ, PME_Nfft);
+
+                SPONGE_FFT_WRAPPER::C2R(PME_plan_c2r, PME_FQ, PME_FBCFQ);
+                Launch_Device_Kernel(
+                    ESP_Sanitize_Float_List,
+                    (PME_Nall + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, PME_FBCFQ,
+                    PME_Nall);
+
+                blockSize = {8, CONTROLLER::device_max_thread / 8};
+                Launch_Device_Kernel(
+                    ESP_Final, (atom_numbers + blockSize.y - 1) / blockSize.y,
+                    blockSize, 0, NULL, ESP_atom_near, charge, PME_FBCFQ,
+                    force_backup, PME_frxyz, rcell, fftx, ffty, fftz,
+                    atom_numbers, PME_Nall, esp.order, ESP_near_grid_points,
+                    esp.table_points, esp.spread_poly_order, use_poly,
+                    ESP_window_table, ESP_window_derivative_table,
+                    ESP_window_coeff, ESP_window_derivative_coeff);
+                Launch_Device_Kernel(
+                    ESP_Sanitize_Vector_List,
+                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, force_backup,
+                    atom_numbers);
+
+                Launch_Device_Kernel(
+                    device_add_force,
+                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, atom_numbers,
+                    update_interval, force, force_backup);
+                Launch_Device_Kernel(
+                    ESP_Sanitize_Vector_List,
+                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, force,
+                    atom_numbers);
+            }
+            if (need_energy)
+            {
+                Launch_Device_Kernel(
+                    ESP_Energy_Product, 1, CONTROLLER::device_max_thread, 0,
+                    NULL, PME_Nall, PME_Q, PME_FBCFQ, d_reciprocal_ene);
+                Scale_List(d_reciprocal_ene, 0.5f, 1);
+
+                Launch_Device_Kernel(
+                    charge_square_kernel,
+                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
+                        CONTROLLER::device_max_thread,
+                    CONTROLLER::device_max_thread, 0, NULL, atom_numbers,
+                    charge, charge_square);
+                Sum_Of_List(charge_square, d_self_ene, atom_numbers);
+                Scale_List(d_self_ene, -esp.self_energy_coeff, 1);
+
+                Launch_Device_Kernel(PME_Add_Energy_To_Potential, 1, 1, 0, NULL,
+                                     d_potential, d_self_ene, d_reciprocal_ene);
+            }
+            return;
         }
         if (step % update_interval == 0)
         {
@@ -1238,6 +2230,112 @@ static __global__ void up_box_bc(int fftx, int ffty, int fftz, float* PME_BC,
     }
 }
 
+static __global__ void up_box_esp_bc(
+    int fftx, int ffty, int fftz, float* ESP_BC, const float* ESP_BC0,
+    LTMatrix3* ESP_virial_BC, LTMatrix3 rcell, float volume, float cutoff,
+    float c_split, int table_points, int split_poly_order, int use_poly,
+    const float* split_fourier_table, const float* split_fourier_coeff,
+    const float* split_fourier_derivative_table,
+    const float* split_fourier_derivative_coeff)
+{
+    float kxrp, kyrp, kzrp;
+    int ky, kz, index;
+    float msq;
+    VECTOR m;
+    LTMatrix3 virial_bc_local;
+    float bc_local;
+    float split_fourier, split_fourier_derivative;
+    float derivative_ratio, metric_factor;
+    const float split_scale = 2.0f * CONSTANT_Pi * cutoff / c_split;
+#ifdef USE_GPU
+    for (int kx = blockIdx.x * blockDim.x + threadIdx.x; kx < fftx;
+         kx += blockDim.x * gridDim.x)
+#else
+#pragma omp parallel for firstprivate(                                      \
+        kxrp, kyrp, kzrp, ky, kz, index, msq, m, virial_bc_local, bc_local, \
+            split_fourier, split_fourier_derivative, derivative_ratio,      \
+            metric_factor)
+    for (int kx = 0; kx < fftx; kx++)
+#endif
+    {
+        kxrp = kx;
+        if (kx > fftx / 2) kxrp = kx - fftx;
+#ifdef USE_GPU
+        for (ky = blockIdx.y * blockDim.y + threadIdx.y; ky < ffty;
+             ky += blockDim.y * gridDim.y)
+#else
+        for (ky = 0; ky < ffty; ky++)
+#endif
+        {
+            kyrp = ky;
+            if (ky > ffty / 2) kyrp = ky - ffty;
+#ifdef USE_GPU
+            for (kz = threadIdx.z; kz <= fftz / 2; kz += blockDim.z)
+#else
+            for (kz = 0; kz <= fftz / 2; kz++)
+#endif
+            {
+                kzrp = kz;
+                m = {kxrp, kyrp, kzrp};
+                m = MultiplyTranspose(m, rcell);
+                msq = m * m;
+
+                index = kx * ffty * (fftz / 2 + 1) + ky * (fftz / 2 + 1) + kz;
+
+                ESP_BC[index] = 0.0f;
+                ESP_virial_BC[index] = {0, 0, 0, 0, 0, 0};
+                if (kx + ky + kz == 0 || msq <= 0.0f)
+                {
+                    continue;
+                }
+
+                float split_arg = split_scale * sqrtf(msq);
+                if (split_arg > 1.0f)
+                {
+                    continue;
+                }
+
+                split_fourier =
+                    0.5f * ESP_Eval_Direct_Scalar(
+                               split_fourier_table, split_fourier_coeff,
+                               table_points, split_poly_order, use_poly,
+                               split_arg);
+                split_fourier_derivative =
+                    0.5f * ESP_Eval_Direct_Scalar(
+                               split_fourier_derivative_table,
+                               split_fourier_derivative_coeff, table_points,
+                               split_poly_order, use_poly, split_arg);
+                if (!ESP_Float_Is_Bounded(ESP_BC0[index], 1.0e12f))
+                {
+                    continue;
+                }
+                bc_local = split_fourier * ESP_BC0[index] /
+                           (CONSTANT_Pi * msq * volume);
+                if (!ESP_Float_Is_Bounded(bc_local, 1.0e6f))
+                {
+                    ESP_BC[index] = 0.0f;
+                    continue;
+                }
+                ESP_BC[index] = bc_local;
+
+                derivative_ratio = 0.0f;
+                if (fabsf(split_fourier) > 1.0e-30f)
+                {
+                    derivative_ratio = split_fourier_derivative / split_fourier;
+                }
+                metric_factor = (2.0f - derivative_ratio) / msq;
+                virial_bc_local.a11 = 1.0f - metric_factor * m.x * m.x;
+                virial_bc_local.a21 = 0.0f - metric_factor * m.y * m.x;
+                virial_bc_local.a22 = 1.0f - metric_factor * m.y * m.y;
+                virial_bc_local.a31 = 0.0f - metric_factor * m.z * m.x;
+                virial_bc_local.a32 = 0.0f - metric_factor * m.z * m.y;
+                virial_bc_local.a33 = 1.0f - metric_factor * m.z * m.z;
+                ESP_virial_BC[index] = 0.5f * bc_local * virial_bc_local;
+            }
+        }
+    }
+}
+
 static void Scale_Positions_Device(const LTMatrix3 g, VECTOR* crd, float dt)
 {
     VECTOR r_dash;
@@ -1252,10 +2350,24 @@ void Particle_Mesh::Update_Box(LTMatrix3 cell, LTMatrix3 rcell, LTMatrix3 g,
                                float dt)
 {
     float volume = cell.a11 * cell.a22 * cell.a33;
-    neutralizing_factor = -0.5 * CONSTANT_Pi / (beta * beta * volume);
-    float mprefactor = PI * PI / -beta / beta;
     dim3 blockSize = {8, 8, CONTROLLER::device_max_thread / 64};
     dim3 gridSize = {64, 64};
+    if (backend == ParticleMeshBackend::ESP)
+    {
+        neutralizing_factor = 0.0f;
+        Launch_Device_Kernel(
+            up_box_esp_bc, gridSize, blockSize, 0, NULL, fftx, ffty, fftz,
+            ESP_BC, ESP_BC0, ESP_Virial_BC, rcell, volume, esp.cutoff,
+            esp.c_split, esp.table_points, esp.split_poly_order,
+            esp.table_mode == ESPTableMode::POLY, ESP_split_fourier_table,
+            ESP_split_fourier_coeff, ESP_split_fourier_derivative_table,
+            ESP_split_fourier_derivative_coeff);
+        Scale_Positions_Device(g, &min_corner, dt);
+        Scale_Positions_Device(g, &max_corner, dt);
+        return;
+    }
+    neutralizing_factor = -0.5 * CONSTANT_Pi / (beta * beta * volume);
+    float mprefactor = PI * PI / -beta / beta;
     Launch_Device_Kernel(up_box_bc, gridSize, blockSize, 0, NULL, fftx, ffty,
                          fftz, PME_BC, PME_BC0, PME_Virial_BC, mprefactor,
                          rcell, volume);

@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include "../PM_force/PM_force.h"
 #include "../common.h"
 #include "../control.h"
 
@@ -140,15 +141,17 @@ struct LENNARD_JONES_INFORMATION
         const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
         const float* charge, VECTOR* frc, const LTMatrix3 cell,
         const LTMatrix3 rcell, const ATOM_GROUP* nl, const float pme_beta,
-        const int need_atom_energy, float* atom_energy, const int need_virial,
-        LTMatrix3* atom_virial, float* atom_direct_pme_energy);
+        const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
+        float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
+        float* atom_direct_pme_energy);
 
 #ifdef KPCCL_TASKLOOP
     void LJ_PME_Direct_Force_With_Atom_Energy_And_Virial_Init(
         const int atom_numbers, const int local_atom_numbers,
         const int ghost_numbers, const VECTOR* crd, const float* charge,
         VECTOR* frc, const LTMatrix3 cell, const LTMatrix3 rcell,
-        const ATOM_GROUP* nl, const float pme_beta, const int need_atom_energy,
+        const ATOM_GROUP* nl, const float pme_beta,
+        const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
         float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
         float* atom_direct_pme_energy);
 
@@ -156,7 +159,8 @@ struct LENNARD_JONES_INFORMATION
         const int atom_numbers, const int local_atom_numbers,
         const int ghost_numbers, const VECTOR* crd, const float* charge,
         VECTOR* frc, const LTMatrix3 cell, const LTMatrix3 rcell,
-        const ATOM_GROUP* nl, const float pme_beta, const int need_atom_energy,
+        const ATOM_GROUP* nl, const float pme_beta,
+        const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
         float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
         float* atom_direct_pme_energy);
 #endif

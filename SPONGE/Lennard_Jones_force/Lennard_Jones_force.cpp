@@ -40,6 +40,24 @@ static __global__ void device_add(float* variable, const float adder)
     variable[0] += adder;
 }
 
+static __global__ void ESP_Sanitize_LJ_Direct_Energy(
+    const int atom_numbers, float* atom_energy, float* atom_direct_cf_energy)
+{
+    SIMPLE_DEVICE_FOR(atom_i, atom_numbers)
+    {
+        if (atom_direct_cf_energy != NULL &&
+            !ESP_Float_Is_Bounded(atom_direct_cf_energy[atom_i], 1.0e5f))
+        {
+            atom_direct_cf_energy[atom_i] = 0.0f;
+        }
+        if (atom_energy != NULL &&
+            !ESP_Float_Is_Bounded(atom_energy[atom_i], 1.0e6f))
+        {
+            atom_energy[atom_i] = 0.0f;
+        }
+    }
+}
+
 template <bool need_force, bool need_energy, bool need_virial,
           bool need_coulomb>
 static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
@@ -47,7 +65,8 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
     const ATOM_GROUP* nl, const VECTOR_LJ* crd, const LTMatrix3 cell,
     const LTMatrix3 rcell, const float* LJ_type_A, const float* LJ_type_B,
     const float cutoff, VECTOR* frc, const float pme_beta, float* atom_energy,
-    LTMatrix3* atom_virial, float* atom_direct_cf_energy, float* atom_LJ_ene)
+    const ESP_Direct_Parameters esp_direct, LTMatrix3* atom_virial,
+    float* atom_direct_cf_energy, float* atom_LJ_ene)
 {
 #ifdef USE_GPU
     int atom_i = 0 + blockDim.y * blockIdx.x + threadIdx.y;
@@ -76,6 +95,11 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
             VECTOR_LJ r2 = crd[atom_j];
             VECTOR dr = Get_Periodic_Displacement(r2, r1, cell, rcell);
             float dr_abs = norm3df(dr.x, dr.y, dr.z);
+            if (esp_direct.enabled &&
+                (!ESP_Float_Is_Finite(dr_abs) || dr_abs <= 1.0e-6f))
+            {
+                continue;
+            }
             if (dr_abs < cutoff)
             {
                 int atom_pair_LJ_type = Get_LJ_Type(r1.LJ_type, r2.LJ_type);
@@ -87,7 +111,16 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                     if (need_coulomb)
                     {
                         float frc_cf_abs =
-                            Get_Direct_Coulomb_Force(r1, r2, dr_abs, pme_beta);
+                            esp_direct.enabled
+                                ? ESP_Get_Direct_Coulomb_Force(
+                                      r1.charge * r2.charge, dr_abs, esp_direct)
+                                : Get_Direct_Coulomb_Force(r1, r2, dr_abs,
+                                                           pme_beta);
+                        if (esp_direct.enabled &&
+                            !ESP_Float_Is_Bounded(frc_cf_abs, 1.0e6f))
+                        {
+                            frc_cf_abs = 0.0f;
+                        }
                         frc_abs = frc_abs - frc_cf_abs;
                     }
                     VECTOR frc_lin = frc_abs * dr;
@@ -108,9 +141,17 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                         ij_factor * Get_LJ_Energy(r1, r2, dr_abs, A, B);
                     if (need_coulomb)
                     {
-                        energy_coulomb +=
-                            ij_factor *
-                            Get_Direct_Coulomb_Energy(r1, r2, dr_abs, pme_beta);
+                        float coulomb_energy =
+                            esp_direct.enabled
+                                ? ESP_Get_Direct_Coulomb_Energy(
+                                      r1.charge * r2.charge, dr_abs, esp_direct)
+                                : Get_Direct_Coulomb_Energy(r1, r2, dr_abs,
+                                                            pme_beta);
+                        if (!esp_direct.enabled ||
+                            ESP_Float_Is_Bounded(coulomb_energy, 1.0e4f))
+                        {
+                            energy_coulomb += ij_factor * coulomb_energy;
+                        }
                     }
                 }
             }
@@ -361,8 +402,9 @@ void LENNARD_JONES_INFORMATION::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
     const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
     const float* charge, VECTOR* frc, const LTMatrix3 cell,
     const LTMatrix3 rcell, const ATOM_GROUP* nl, const float pme_beta,
-    const int need_atom_energy, float* atom_energy, const int need_virial,
-    LTMatrix3* atom_virial, float* atom_direct_pme_energy)
+    const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
+    float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
+    float* atom_direct_pme_energy)
 {
     if (is_initialized)
     {
@@ -411,8 +453,17 @@ void LENNARD_JONES_INFORMATION::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
         Launch_Device_Kernel(
             f, gridSize, blockSize, 0, NULL, local_atom_numbers,
             solvent_numbers, nl, crd_with_LJ_parameters_local, cell, rcell,
-            d_LJ_A, d_LJ_B, cutoff, frc, pme_beta, atom_energy, atom_virial,
-            atom_direct_pme_energy, d_LJ_energy_atom);
+            d_LJ_A, d_LJ_B, cutoff, frc, pme_beta, atom_energy, esp_direct,
+            atom_virial, atom_direct_pme_energy, d_LJ_energy_atom);
+        if (esp_direct.enabled && need_atom_energy)
+        {
+            Launch_Device_Kernel(
+                ESP_Sanitize_LJ_Direct_Energy,
+                (this->atom_numbers + CONTROLLER::device_max_thread - 1) /
+                    CONTROLLER::device_max_thread,
+                CONTROLLER::device_max_thread, 0, NULL, this->atom_numbers,
+                atom_energy, atom_direct_pme_energy);
+        }
     }
 }
 

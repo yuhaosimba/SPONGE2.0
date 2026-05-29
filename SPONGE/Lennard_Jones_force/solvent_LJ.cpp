@@ -30,7 +30,8 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
     const int* d_res_start, const VECTOR_LJ* crd, const LTMatrix3 cell,
     const LTMatrix3 rcell, const float* LJ_type_A, const float* LJ_type_B,
     const float cutoff, VECTOR* frc, const float pme_beta, float* atom_energy,
-    LTMatrix3* atom_lj_virial, float* atom_direct_cf_energy, float* this_energy)
+    const ESP_Direct_Parameters esp_direct, LTMatrix3* atom_lj_virial,
+    float* atom_direct_cf_energy, float* this_energy)
 {
     __shared__ float r1s_x[128];
     __shared__ float r1s_y[128];
@@ -78,6 +79,11 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                     r1s_charge[shared_idx]};
                 VECTOR dr = Get_Periodic_Displacement(r2, r1, cell, rcell);
                 float dr_abs = norm3df(dr.x, dr.y, dr.z);
+                if (esp_direct.enabled &&
+                    (!ESP_Float_Is_Finite(dr_abs) || dr_abs <= 1.0e-6f))
+                {
+                    continue;
+                }
                 if (dr_abs < cutoff)
                 {
                     int atom_pair_LJ_type = Get_LJ_Type(r1.LJ_type, r2.LJ_type);
@@ -88,8 +94,18 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                         float frc_abs = Get_LJ_Force(r1, r2, dr_abs, A, B);
                         if (need_coulomb)
                         {
-                            float frc_cf_abs = Get_Direct_Coulomb_Force(
-                                r1, r2, dr_abs, pme_beta);
+                            float frc_cf_abs =
+                                esp_direct.enabled
+                                    ? ESP_Get_Direct_Coulomb_Force(
+                                          r1.charge * r2.charge, dr_abs,
+                                          esp_direct)
+                                    : Get_Direct_Coulomb_Force(r1, r2, dr_abs,
+                                                               pme_beta);
+                            if (esp_direct.enabled &&
+                                !ESP_Float_Is_Bounded(frc_cf_abs, 1.0e6f))
+                            {
+                                frc_cf_abs = 0.0f;
+                            }
                             frc_abs = frc_abs - frc_cf_abs;
                         }
                         VECTOR frc_lin = frc_abs * dr;
@@ -109,9 +125,18 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                             ij_factor * Get_LJ_Energy(r1, r2, dr_abs, A, B);
                         if (need_coulomb)
                         {
-                            energy_coulomb +=
-                                ij_factor * Get_Direct_Coulomb_Energy(
-                                                r1, r2, dr_abs, pme_beta);
+                            float coulomb_energy =
+                                esp_direct.enabled
+                                    ? ESP_Get_Direct_Coulomb_Energy(
+                                          r1.charge * r2.charge, dr_abs,
+                                          esp_direct)
+                                    : Get_Direct_Coulomb_Energy(
+                                          r1, r2, dr_abs, pme_beta);
+                            if (!esp_direct.enabled ||
+                                ESP_Float_Is_Bounded(coulomb_energy, 1.0e4f))
+                            {
+                                energy_coulomb += ij_factor * coulomb_energy;
+                            }
                         }
                     }
                 }
@@ -256,8 +281,9 @@ void SOLVENT_LENNARD_JONES::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
     const int atom_numbers, const int residue_numbers, const int* d_res_start,
     const VECTOR* crd, const float* charge, VECTOR* frc, const LTMatrix3 cell,
     const LTMatrix3 rcell, const ATOM_GROUP* nl, const float pme_beta,
-    const int need_atom_energy, float* atom_energy, const int need_virial,
-    LTMatrix3* atom_lj_virial, float* atom_direct_pme_energy)
+    const int need_atom_energy, const ESP_Direct_Parameters esp_direct,
+    float* atom_energy, const int need_virial, LTMatrix3* atom_lj_virial,
+    float* atom_direct_pme_energy)
 {
     if (is_initialized)
     {
@@ -304,7 +330,7 @@ void SOLVENT_LENNARD_JONES::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
                         solvent_start_local, residue_numbers, d_res_start,
                         lj_info->crd_with_LJ_parameters_local, cell, rcell,
                         lj_info->d_LJ_A, lj_info->d_LJ_B, lj_info->cutoff, frc,
-                        pme_beta, atom_energy, atom_lj_virial,
+                        pme_beta, atom_energy, esp_direct, atom_lj_virial,
                         atom_direct_pme_energy, lj_info->d_LJ_energy_atom);
                 }
                 else if (lj_soft_info->is_initialized)
@@ -345,7 +371,7 @@ void SOLVENT_LENNARD_JONES::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
                         solvent_start_local, residue_numbers, d_res_start,
                         soft_to_hard_crd, cell, rcell, lj_soft_info->d_LJ_AA,
                         lj_soft_info->d_LJ_AB, lj_soft_info->cutoff, frc,
-                        pme_beta, atom_energy, atom_lj_virial,
+                        pme_beta, atom_energy, esp_direct, atom_lj_virial,
                         atom_direct_pme_energy, lj_soft_info->d_LJ_energy_atom);
                 }
                 break;
@@ -380,7 +406,7 @@ void SOLVENT_LENNARD_JONES::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
                         solvent_start_local, residue_numbers, d_res_start,
                         lj_info->crd_with_LJ_parameters_local, cell, rcell,
                         lj_info->d_LJ_A, lj_info->d_LJ_B, lj_info->cutoff, frc,
-                        pme_beta, atom_energy, atom_lj_virial,
+                        pme_beta, atom_energy, esp_direct, atom_lj_virial,
                         atom_direct_pme_energy, lj_info->d_LJ_energy_atom);
                 }
                 else if (lj_soft_info->is_initialized)
@@ -421,7 +447,7 @@ void SOLVENT_LENNARD_JONES::LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
                         solvent_start_local, residue_numbers, d_res_start,
                         soft_to_hard_crd, cell, rcell, lj_soft_info->d_LJ_AA,
                         lj_soft_info->d_LJ_AB, lj_soft_info->cutoff, frc,
-                        pme_beta, atom_energy, atom_lj_virial,
+                        pme_beta, atom_energy, esp_direct, atom_lj_virial,
                         atom_direct_pme_energy, lj_soft_info->d_LJ_energy_atom);
                 }
                 break;
