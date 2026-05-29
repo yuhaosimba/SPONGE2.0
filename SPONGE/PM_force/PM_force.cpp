@@ -435,8 +435,9 @@ static void ESP_Upload_Float_Vector(float** device_ptr,
                                     const std::vector<float>& values)
 {
     if (values.empty()) return;
-    Device_Malloc_And_Copy_Safely((void**)device_ptr, (void*)values.data(),
-                                  sizeof(float) * values.size());
+    Device_Malloc_Safely((void**)device_ptr, sizeof(float) * values.size());
+    deviceMemcpy(*device_ptr, values.data(), sizeof(float) * values.size(),
+                 deviceMemcpyHostToDevice);
 }
 
 static void Allocate_ESP_PSWF_Buffers(Particle_Mesh* pme,
@@ -957,7 +958,8 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
         esp.psi0_split = esp_pswf.psi0_split;
         esp.lambda_split = esp_pswf.lambda_split;
         esp.lambda_spread = esp_pswf.lambda_spread;
-        esp.self_energy_coeff = esp_pswf.self_energy_coeff;
+        const float esp_raw_self_energy_coeff = esp_pswf.self_energy_coeff;
+        esp.self_energy_coeff = beta / sqrtf(CONSTANT_Pi);
         esp.max_window_table_error = esp_pswf.max_window_table_error;
         esp.max_split_table_error = esp_pswf.max_split_table_error;
         esp.max_window_poly_error = esp_pswf.max_window_poly_error;
@@ -972,6 +974,8 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
         controller->printf("    ESP psi0_split: %.8e\n", esp.psi0_split);
         controller->printf("    ESP lambda_split: %.8e\n", esp.lambda_split);
         controller->printf("    ESP lambda_spread: %.8e\n", esp.lambda_spread);
+        controller->printf("    ESP raw self_energy_coeff: %.8e\n",
+                           esp_raw_self_energy_coeff);
         controller->printf("    ESP self_energy_coeff: %.8e\n",
                            esp.self_energy_coeff);
         controller->printf("    ESP near grid points per atom: %d\n",

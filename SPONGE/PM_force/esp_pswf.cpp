@@ -1,6 +1,7 @@
 ﻿#include "esp_pswf.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -98,10 +99,10 @@ void Gauss_Legendre(int n, std::vector<double>& x, std::vector<double>& w)
     }
 }
 
-class Pswf0Reference
+class Pswf0LegacyReference
 {
    public:
-    Pswf0Reference(double c, int nquad) : c_(c)
+    Pswf0LegacyReference(double c, int nquad) : c_(c)
     {
         Gauss_Legendre(nquad, nodes_, weights_);
         const int n = static_cast<int>(nodes_.size());
@@ -229,6 +230,506 @@ class Pswf0Reference
     std::vector<double> nodes_;
     std::vector<double> weights_;
     std::vector<double> values_;
+};
+
+void Ref_LegeExev(double x, double& val, const double* pexp, int n)
+{
+    double pjm2 = 1.0;
+    double pjm1 = x;
+    val = pexp[0] * pjm2 + pexp[1] * pjm1;
+    for (int j = 2; j <= n; ++j)
+    {
+        double pj = ((2.0 * j - 1.0) * x * pjm1 - (j - 1.0) * pjm2) / j;
+        val += pexp[j] * pj;
+        pjm2 = pjm1;
+        pjm1 = pj;
+    }
+}
+
+void Ref_LegeFDer(double x, double& val, double& der, const double* pexp,
+                  int n)
+{
+    double pjm2 = 1.0;
+    double pjm1 = x;
+    double derjm2 = 0.0;
+    double derjm1 = 1.0;
+    val = pexp[0] * pjm2 + pexp[1] * pjm1;
+    der = pexp[1];
+    for (int j = 2; j <= n; ++j)
+    {
+        double pj = ((2.0 * j - 1.0) * x * pjm1 - (j - 1.0) * pjm2) / j;
+        val += pexp[j] * pj;
+        double derj =
+            (2.0 * j - 1.0) * (pjm1 + x * derjm1) - (j - 1.0) * derjm2;
+        derj /= j;
+        der += pexp[j] * derj;
+        pjm2 = pjm1;
+        pjm1 = pj;
+        derjm2 = derjm1;
+        derjm1 = derj;
+    }
+}
+
+void Ref_Prosinin(double c, const double* ts, const double* whts,
+                  const double* fs, double x, int n, double& rint,
+                  double& derrint)
+{
+    rint = 0.0;
+    derrint = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        double diff = x - ts[i];
+        double sin_term = std::sin(c * diff);
+        double cos_term = std::cos(c * diff);
+        rint += whts[i] * fs[i] * sin_term / diff;
+        derrint += whts[i] * fs[i] / (diff * diff) *
+                   (c * diff * cos_term - sin_term);
+    }
+}
+
+void Ref_Prolcoef(double rlam, int k, double c, double& alpha, double& beta,
+                  double& gamma)
+{
+    double d = k * (k - 1.0);
+    d = d / (2.0 * k + 1.0) / (2.0 * k - 1.0);
+    double uk = d;
+
+    d = (k + 1.0) * (k + 1.0);
+    d = d / (2.0 * k + 3.0);
+    double d2 = k * k;
+    d2 = d2 / (2.0 * k - 1.0);
+    double vk = (d + d2) / (2.0 * k + 1.0);
+
+    d = (k + 1.0) * (k + 2.0);
+    d = d / (2.0 * k + 1.0) / (2.0 * k + 3.0);
+    double wk = d;
+
+    alpha = -c * c * uk;
+    beta = rlam - k * (k + 1.0) - c * c * vk;
+    gamma = -c * c * wk;
+}
+
+void Ref_Prolmatr(double* as, double* bs, double* cs, int n, double c,
+                  double rlam, int ifsymm, int ifodd)
+{
+    const double half = 0.5;
+    int k = 0;
+    if (ifodd > 0)
+    {
+        for (int k0 = 1; k0 <= n + 2; k0 += 2)
+        {
+            k++;
+            double alpha, beta, gamma;
+            Ref_Prolcoef(rlam, k0, c, alpha, beta, gamma);
+            as[k - 1] = alpha;
+            bs[k - 1] = beta;
+            cs[k - 1] = gamma;
+            if (ifsymm != 0)
+            {
+                if (k0 > 1)
+                {
+                    as[k - 1] = as[k - 1] / std::sqrt(k0 - 2.0 + half) *
+                                std::sqrt(k0 + half);
+                }
+                cs[k - 1] = cs[k - 1] * std::sqrt(k0 + half) /
+                            std::sqrt(k0 + half + 2.0);
+            }
+        }
+    }
+    else
+    {
+        for (int k0 = 0; k0 <= n + 2; k0 += 2)
+        {
+            k++;
+            double alpha, beta, gamma;
+            Ref_Prolcoef(rlam, k0, c, alpha, beta, gamma);
+            as[k - 1] = alpha;
+            bs[k - 1] = beta;
+            cs[k - 1] = gamma;
+            if (ifsymm != 0)
+            {
+                if (k0 != 0)
+                {
+                    as[k - 1] = as[k - 1] / std::sqrt(k0 - 2.0 + half) *
+                                std::sqrt(k0 + half);
+                }
+                cs[k - 1] = cs[k - 1] * std::sqrt(k0 + half) /
+                            std::sqrt(k0 + half + 2.0);
+            }
+        }
+    }
+}
+
+void Ref_Prolql1(int n, double* d, double* e, int& ierr)
+{
+    ierr = 0;
+    if (n == 1) return;
+    for (int i = 1; i < n; ++i) e[i - 1] = e[i];
+    e[n - 1] = 0.0;
+
+    for (int l = 0; l < n; ++l)
+    {
+        int j = 0;
+        while (true)
+        {
+            int m;
+            for (m = l; m < n - 1; ++m)
+            {
+                double tst1 = std::abs(d[m]) + std::abs(d[m + 1]);
+                double tst2 = tst1 + std::abs(e[m]);
+                if (tst2 == tst1) break;
+            }
+            if (m == l) break;
+            if (j == 30)
+            {
+                ierr = l + 1;
+                return;
+            }
+            ++j;
+
+            double g = (d[l + 1] - d[l]) / (2.0 * e[l]);
+            double r = std::sqrt(g * g + 1.0);
+            g = d[m] - d[l] + e[l] / (g + std::copysign(r, g));
+            double s = 1.0;
+            double c = 1.0;
+            double p = 0.0;
+
+            for (int i = m - 1; i >= l; --i)
+            {
+                double f = s * e[i];
+                double b = c * e[i];
+                r = std::sqrt(f * f + g * g);
+                e[i + 1] = r;
+                if (r == 0.0)
+                {
+                    d[i + 1] -= p;
+                    e[m] = 0.0;
+                    break;
+                }
+                s = f / r;
+                c = g / r;
+                g = d[i + 1] - p;
+                r = (d[i] - g) * s + 2.0 * c * b;
+                p = s * r;
+                d[i + 1] = g + p;
+                g = c * r - b;
+            }
+            if (r == 0.0) break;
+            d[l] -= p;
+            e[l] = g;
+            e[m] = 0.0;
+        }
+
+        if (l == 0) continue;
+        for (int i = l; i > 0; --i)
+        {
+            if (d[i] >= d[i - 1]) break;
+            std::swap(d[i], d[i - 1]);
+        }
+    }
+}
+
+void Ref_Prolfact(double* a, double* b, double* c, int n, double* u,
+                  double* v, double* w)
+{
+    for (int i = 0; i < n - 1; ++i)
+    {
+        double d = c[i + 1] / a[i];
+        a[i + 1] -= b[i] * d;
+        u[i] = d;
+    }
+    for (int i = n - 1; i > 0; --i)
+    {
+        v[i] = b[i - 1] / a[i];
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        w[i] = 1.0 / a[i];
+    }
+}
+
+void Ref_Prolsolv(const double* u, const double* v, const double* w, int n,
+                  double* rhs)
+{
+    for (int i = 0; i < n - 1; ++i) rhs[i + 1] -= u[i] * rhs[i];
+    for (int i = n - 1; i > 0; --i) rhs[i - 1] -= rhs[i] * v[i];
+    for (int i = 0; i < n; ++i) rhs[i] *= w[i];
+}
+
+void Ref_Prolfun0(int& ier, int n, double c, double* as, double* bs,
+                  double* cs, double* xk, double* u, double* v, double* w,
+                  double eps, int& nterms, double& rkhi)
+{
+    ier = 0;
+    const double delta = 1.0e-8;
+    const int ifsymm = 1;
+    const int numit = 4;
+    double rlam = 0.0;
+    const int ifodd = -1;
+
+    Ref_Prolmatr(as, bs, cs, n, c, rlam, ifsymm, ifodd);
+    Ref_Prolql1(n / 2, bs, as, ier);
+    if (ier != 0)
+    {
+        ier = 2048;
+        return;
+    }
+
+    rkhi = -bs[n / 2 - 1];
+    rlam = -bs[n / 2 - 1] + delta;
+    std::fill(xk, xk + n, 1.0);
+
+    Ref_Prolmatr(as, bs, cs, n, c, rlam, ifsymm, ifodd);
+    Ref_Prolfact(bs, cs, as, n / 2, u, v, w);
+
+    for (int iter = 0; iter < numit; ++iter)
+    {
+        Ref_Prolsolv(u, v, w, n / 2, xk);
+        double d = 0.0;
+        for (int j = 0; j < n / 2; ++j) d += xk[j] * xk[j];
+        d = std::sqrt(d);
+        for (int j = 0; j < n / 2; ++j) xk[j] /= d;
+
+        double err = 0.0;
+        for (int j = 0; j < n / 2; ++j)
+        {
+            err += (as[j] - xk[j]) * (as[j] - xk[j]);
+            as[j] = xk[j];
+        }
+        err = std::sqrt(err);
+        (void)err;
+    }
+
+    for (int i = 0; i < n / 2; ++i)
+    {
+        if (std::abs(xk[i]) > eps) nterms = i + 1;
+        xk[i] *= std::sqrt(i * 2.0 + 0.5);
+        cs[i] = xk[i];
+    }
+
+    int j = 0;
+    for (int i = 0; i <= nterms; ++i)
+    {
+        xk[j++] = cs[i];
+        xk[j++] = 0.0;
+    }
+    nterms *= 2;
+}
+
+void Ref_Prolps0i(int& ier, double c, double* w, int lenw, int& nterms,
+                  int& ltot, double& rkhi)
+{
+    static const int ns[20] = {48,  64,  80,  92,  106, 120, 130, 144, 156, 168,
+                               178, 190, 202, 214, 224, 236, 248, 258, 268, 280};
+    const double eps = 1.0e-16;
+    int n = static_cast<int>(c * 3.0);
+    n = n / 2;
+    int i = static_cast<int>(c / 10.0);
+    if (i <= 19) n = ns[i];
+
+    ier = 0;
+    int ixk = 1;
+    int lxk = n + 2;
+    int ias = ixk + lxk;
+    int las = n + 2;
+    int ibs = ias + las;
+    int lbs = n + 2;
+    int ics = ibs + lbs;
+    int lcs = n + 2;
+    int iu = ics + lcs;
+    int lu = n + 2;
+    int iv = iu + lu;
+    int lv = n + 2;
+    int iw = iv + lv;
+    int lw = n + 2;
+    ltot = iw + lw;
+
+    if (ltot >= lenw)
+    {
+        ier = 512;
+        return;
+    }
+
+    Ref_Prolfun0(ier, n, c, w + ias - 1, w + ibs - 1, w + ics - 1,
+                 w + ixk - 1, w + iu - 1, w + iv - 1, w + iw - 1, eps,
+                 nterms, rkhi);
+}
+
+void Ref_Gauss_Legendre_Array(int n, double* xs, double* ws)
+{
+    std::vector<double> x, w;
+    Gauss_Legendre(n, x, w);
+    for (int i = 0; i < n; ++i)
+    {
+        xs[i] = x[i];
+        ws[i] = w[i];
+    }
+}
+
+void Ref_Prol0ini(int& ier, double c, double* w, double& rlam20,
+                  double& rkhi, int lenw, int& keep, int& ltot)
+{
+    ier = 0;
+    const double thresh = 45.0;
+    const int iw = 11;
+    w[0] = iw + 0.1;
+    w[8] = thresh;
+
+    int nterms = 0;
+    Ref_Prolps0i(ier, c, w + iw - 1, lenw, nterms, ltot, rkhi);
+    if (ier != 0) return;
+
+    if (c >= thresh)
+    {
+        w[7] = c;
+        w[4] = nterms + 0.1;
+        keep = nterms + 3;
+        return;
+    }
+
+    int ngauss = nterms * 2;
+    int lw = nterms + 2;
+    int its = iw + lw;
+    int lts = ngauss + 2;
+    int iwhts = its + lts;
+    int lwhts = ngauss + 2;
+    int ifs = iwhts + lwhts;
+    int lfs = ngauss + 2;
+
+    keep = ifs + lfs;
+    if (keep > ltot) ltot = keep;
+    if (keep >= lenw)
+    {
+        ier = 1024;
+        return;
+    }
+
+    w[1] = its + 0.1;
+    w[2] = iwhts + 0.1;
+    w[3] = ifs + 0.1;
+
+    Ref_Gauss_Legendre_Array(ngauss, w + its - 1, w + iwhts - 1);
+    for (int i = 0; i < ngauss; ++i)
+    {
+        Ref_LegeExev(w[its + i - 1], w[ifs + i - 1], w + iw - 1, nterms - 1);
+    }
+
+    double rlam = 0.0;
+    double f0 = 0.0;
+    Ref_LegeExev(0.0, f0, w + iw - 1, nterms - 1);
+    double der = 0.0;
+    Ref_Prosinin(c, w + its - 1, w + iwhts - 1, w + ifs - 1, 0.0, ngauss,
+                 rlam, der);
+    rlam = rlam / f0;
+    rlam20 = rlam;
+
+    w[4] = nterms + 0.1;
+    w[5] = ngauss + 0.1;
+    w[6] = rlam;
+    w[7] = c;
+}
+
+void Ref_Prol0eva(double x, const double* w, double& psi0, double& derpsi0)
+{
+    int iw = static_cast<int>(w[0]);
+    int its = static_cast<int>(w[1]);
+    int iwhts = static_cast<int>(w[2]);
+    int ifs = static_cast<int>(w[3]);
+    int nterms = static_cast<int>(w[4]);
+    int ngauss = static_cast<int>(w[5]);
+    double rlam = w[6];
+    double c = w[7];
+    double thresh = w[8];
+
+    if (std::abs(x) > 1.0)
+    {
+        if (c >= thresh - 1.0e-10)
+        {
+            psi0 = 0.0;
+            derpsi0 = 0.0;
+            return;
+        }
+        Ref_Prosinin(c, &w[its - 1], &w[iwhts - 1], &w[ifs - 1], x, ngauss,
+                     psi0, derpsi0);
+        psi0 /= rlam;
+        derpsi0 /= rlam;
+        return;
+    }
+
+    Ref_LegeFDer(x, psi0, derpsi0, &w[iw - 1], nterms - 2);
+}
+
+void Ref_Prol0int0r(const double* w, double r, double& val)
+{
+    if (r <= 0.0)
+    {
+        val = 0.0;
+        return;
+    }
+    constexpr int npts = 200;
+    static std::vector<double> xs;
+    static std::vector<double> ws;
+    if (xs.empty())
+    {
+        Gauss_Legendre(npts, xs, ws);
+    }
+    double derpsi0 = 0.0;
+    val = 0.0;
+    for (int i = 0; i < npts; ++i)
+    {
+        double xs_r = (xs[i] + 1.0) * r / 2.0;
+        double fval = 0.0;
+        Ref_Prol0eva(xs_r, w, fval, derpsi0);
+        val += ws[i] * r / 2.0 * fval;
+    }
+}
+
+class Pswf0Reference
+{
+   public:
+    explicit Pswf0Reference(double c, int) : c_(c), lenw_(10000)
+    {
+        workarray_.resize(lenw_, 0.0);
+        int ier = 0;
+        Ref_Prol0ini(ier, c_, workarray_.data(), rlam20_, rkhi_, lenw_, keep_,
+                     ltot_);
+        if (ier != 0)
+        {
+            throw std::runtime_error("ESP PSWF reference initialization failed");
+        }
+    }
+
+    double value(double x) const
+    {
+        double psi = 0.0;
+        double der = 0.0;
+        Ref_Prol0eva(x, workarray_.data(), psi, der);
+        return psi;
+    }
+
+    double derivative(double x) const
+    {
+        double psi = 0.0;
+        double der = 0.0;
+        Ref_Prol0eva(x, workarray_.data(), psi, der);
+        return der;
+    }
+
+    double integral0(double r) const
+    {
+        double val = 0.0;
+        Ref_Prol0int0r(workarray_.data(), r, val);
+        return val;
+    }
+
+   private:
+    double c_ = 0.0;
+    int lenw_ = 0;
+    int keep_ = 0;
+    int ltot_ = 0;
+    double rlam20_ = 0.0;
+    double rkhi_ = 0.0;
+    std::vector<double> workarray_;
 };
 
 double Compute_Lambda(const Pswf0Reference& pswf, double c)
