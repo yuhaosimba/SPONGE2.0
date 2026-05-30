@@ -45,9 +45,6 @@ direct-reference fixtures before production use:
 backend = "esp"
 Direct_Tolerance = 1e-5
 esp_tolerance = 1e-5
-esp_order = 8
-esp_grid_spacing = 1.5
-esp_parameter_mode = "auto"
 esp_table_mode = "poly"
 esp_table_points = 4096
 esp_print_detail = true
@@ -56,16 +53,17 @@ esp_print_detail = true
 | Parameter | Scope | Type | Default | Description |
 |-----------|-------|------|---------|-------------|
 | `esp_tolerance` | `PM` | float | `Direct_Tolerance` | Target ESP electrostatic tolerance |
-| `esp_order` | `PM` | int | auto | PSWF compact support width `P` |
-| `esp_grid_spacing` | `PM` | float | auto | Optional ESP-specific grid spacing in angstrom |
-| `esp_parameter_mode` | `PM` | string | `auto` | `auto` or `manual` parameter selection |
+| `esp_order` | `PM` | int | auto | PSWF compact support width `P`. If omitted, ESP selects it from tolerance and the active grid. |
+| `esp_grid_spacing` | `PM` | float | auto | Optional ESP-specific grid spacing in angstrom. If omitted and no explicit FFT grid is given, ESP derives a default grid from tolerance and cutoff. |
+| `esp_parameter_mode` | `PM` | string | `auto` | Reserved compatibility key. Current startup-time ESP default selection does not require it. |
 | `esp_table_mode` | `PM` | string | `poly` | `poly` coefficient mode or sampled `table` mode |
 | `esp_table_points` | `PM` | int | `4096` | Table resolution for ESP lookup-table mode and diagnostics |
 | `esp_print_detail` | `PM` | bool | `false` | Print ESP parameters and diagnostics during initialization |
 
 When `backend = "esp"` and `esp_grid_spacing` is provided, it overrides
-`grid_spacing` for the ESP Fourier grid. If it is omitted, the ordinary
-`grid_spacing` value is used.
+`grid_spacing` for the ESP Fourier grid. If `esp_grid_spacing`, `grid_spacing`,
+and `fftx/ffty/fftz` are all omitted, ESP derives a backend-specific default
+grid from `esp_tolerance` and `cutoff`.
 
 ## Compatibility Keys In `[PME]`
 

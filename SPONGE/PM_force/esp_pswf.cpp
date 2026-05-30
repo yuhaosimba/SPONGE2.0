@@ -866,9 +866,13 @@ ESP_PSWF_Table Build_ESP_PSWF_Table(const ESP_Parameters& parameters)
     table.split_poly_order = 16;
 
     const double spread_tol = Clamp_Tolerance(parameters.tolerance * 0.5);
-    table.c_spread = static_cast<float>(Prolate_C_From_Table(spread_tol));
-    table.c_split =
-        static_cast<float>(Prolate_C_From_Table(parameters.tolerance));
+    table.c_spread = parameters.c_spread > 0.0f
+                         ? parameters.c_spread
+                         : static_cast<float>(Prolate_C_From_Table(spread_tol));
+    table.c_split = parameters.c_split > 0.0f
+                        ? parameters.c_split
+                        : static_cast<float>(
+                              Prolate_C_From_Table(parameters.tolerance));
 
     Pswf0Reference spread_pswf(table.c_spread, 128);
     Pswf0Reference split_pswf(table.c_split, 128);

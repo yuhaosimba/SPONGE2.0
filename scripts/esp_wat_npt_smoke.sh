@@ -117,16 +117,12 @@ dont_check_input = 1
 [PM]
 backend = "${PM_BACKEND}"
 Direct_Tolerance = 1e-4
-grid_spacing = 1.0
 print_detail = true
 EOF
 
 if [[ "${PM_BACKEND}" == "esp" ]]; then
   cat >> "${CASE_DIR}/mdin.spg.toml" <<'EOF'
 esp_tolerance = 1e-4
-esp_order = 6
-esp_grid_spacing = 1.6
-esp_parameter_mode = "manual"
 esp_table_mode = "poly"
 esp_table_points = 1024
 esp_print_detail = true

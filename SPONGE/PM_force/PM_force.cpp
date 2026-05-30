@@ -1,19 +1,17 @@
 ﻿#include "PM_force.h"
 
+#include <algorithm>
+#include <cmath>
 #include <exception>
 
 #include "esp_pswf.h"
 
 /*
-    2025-10-14 SPONGE Particle Mesh算法
-    目前支持单进程Particle-Mesh-Ewald 与 PMC-IZ
-   计算，在头文件预留了MPI-FFT多进程接口
-    单进程下，PM进程与PP进程设置为同一个进程；多进程下PM独享一个进程
-
-    未来可能的改进：使用PSWF作为分裂核与插值核，改进Particle
-   Mesh算法，需要修改：
-    - 插值核 与 修正系数计算。可以引用NUFFT相关代码
-    - 近程项、长程修正项等
+    SPONGE particle-mesh implementation.
+    Public entry points stay in Particle_Mesh, while reciprocal-space work
+    dispatches between the traditional PME backend and the ESP/PSWF backend.
+    The MPI FFT interfaces remain declared, but the current ESP path targets
+    single-process execution.
 */
 
 // constants
@@ -27,6 +25,98 @@ static __device__ float PME_Md[4] = {0, 1.0 / 6.0, 4.0 / 6.0, 1.0 / 6.0};
 static __device__ float PME_dMa[4] = {0.5, -1.5, 1.5, -0.5};
 static __device__ float PME_dMb[4] = {0, 1, -2, 1};
 static __device__ float PME_dMc[4] = {0, 0.5, 0, -0.5};
+
+struct ESP_Default_Selection
+{
+    float c_split = 0.0f;
+    float c_window = 0.0f;
+    float alpha = 0.0f;
+    float target_grid_spacing = 0.0f;
+    float effective_grid_spacing = 0.0f;
+    int fftx = 0;
+    int ffty = 0;
+    int fftz = 0;
+    int order = 0;
+};
+
+static float ESP_Default_Box_Length_Reference(VECTOR box_length)
+{
+    float ref = box_length.x;
+    if (box_length.y > 0.0f) ref = std::min(ref, box_length.y);
+    if (box_length.z > 0.0f) ref = std::min(ref, box_length.z);
+    return ref;
+}
+
+static int ESP_Get_Friendly_Fft_Count(float target_count)
+{
+    int count = std::max(4, (int)ceilf(target_count));
+    if (count % 2 != 0) count += 1;
+    while (!Check_2357_Factor(count))
+    {
+        count += 2;
+    }
+    return count;
+}
+
+static float ESP_Solve_Window_Bandlimit(float c_split, float cutoff,
+                                        float box_length_ref)
+{
+    const double ratio = 4.0 * sqrt(5.0) / pow((double)CONSTANT_Pi, 1.5);
+    const double cs = std::max((double)c_split, 1.0);
+    const double rc = std::max((double)cutoff, 1.0e-6);
+    const double lref = std::max((double)box_length_ref, rc + 1.0e-6);
+    const double rhs =
+        cs + 0.5 * std::log(cs) - std::log(ratio) + 0.5 * std::log(lref / rc);
+
+    double cw = std::max(rhs, 1.0);
+    for (int iter = 0; iter < 32; iter++)
+    {
+        const double f = cw - 0.5 * std::log(cw) - rhs;
+        const double df = 1.0 - 0.5 / cw;
+        const double step = f / df;
+        cw -= step;
+        if (cw <= 0.5) cw = 0.5 + 1.0e-6;
+        if (std::abs(step) <= 1.0e-12 * std::max(1.0, cw))
+        {
+            break;
+        }
+    }
+    return (float)cw;
+}
+
+static ESP_Default_Selection Build_ESP_Default_Selection(float tolerance,
+                                                         float cutoff,
+                                                         VECTOR box_length)
+{
+    ESP_Default_Selection selection;
+    const float clamped_tolerance =
+        std::min(std::max(tolerance, 1.0e-12f), 0.5f);
+    const float box_length_ref = ESP_Default_Box_Length_Reference(box_length);
+    if (cutoff <= 0.0f || box_length_ref <= 0.0f)
+    {
+        return selection;
+    }
+
+    selection.c_split = std::max(1.0f, ESP_Get_Prolate_C(clamped_tolerance));
+    selection.c_window =
+        ESP_Solve_Window_Bandlimit(selection.c_split, cutoff, box_length_ref);
+    selection.alpha = cutoff * selection.c_window / selection.c_split;
+    selection.target_grid_spacing = CONSTANT_Pi * cutoff / selection.c_split;
+
+    selection.fftx =
+        ESP_Get_Friendly_Fft_Count(box_length.x / selection.target_grid_spacing);
+    selection.ffty =
+        ESP_Get_Friendly_Fft_Count(box_length.y / selection.target_grid_spacing);
+    selection.fftz =
+        ESP_Get_Friendly_Fft_Count(box_length.z / selection.target_grid_spacing);
+    selection.effective_grid_spacing =
+        std::min(box_length.x / selection.fftx,
+                 std::min(box_length.y / selection.ffty,
+                          box_length.z / selection.fftz));
+    selection.order = std::max(
+        4, (int)ceilf(2.0f * selection.alpha / selection.effective_grid_spacing));
+    return selection;
+}
 
 // 计算B样条插值的递归函数 (compact-window function, or SI kernel)
 static float M_(float u, int n)
@@ -728,6 +818,10 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
                          cutoff);
     controller->printf("    particle mesh backend: %s\n",
                        Particle_Mesh_Backend_Name(backend));
+    const bool pm_grid_spacing_explicit =
+        controller->Command_Exist(this->module_name, "grid_spacing");
+    const bool esp_order_explicit = esp.order > 0;
+    const bool esp_grid_spacing_explicit = esp.grid_spacing > 0.0f;
 
     if (CONTROLLER::PP_MPI_size == 1)
     {
@@ -775,7 +869,7 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
     {
         controller->printf("PM RECI NOT INITIALIZED");
     }
-    // 2025-10-14: temporary disable multi-process PME
+    // Multi-process PME/ESP is not enabled in the current implementation.
     if (PM_MPI_size > 1)
     {
         controller->Throw_SPONGE_Error(
@@ -789,9 +883,27 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
                          sizeof(int) * max_atom_numbers * 6);
 
     float volume = cell.a11 * cell.a22 * cell.a33;
+    ESP_Default_Selection esp_defaults;
+    const bool fft_explicit_before_auto =
+        fftx >= 0 || ffty >= 0 || fftz >= 0;
+    const bool esp_auto_grid =
+        backend == ParticleMeshBackend::ESP && !fft_explicit_before_auto &&
+        !esp_grid_spacing_explicit && !pm_grid_spacing_explicit;
+    if (backend == ParticleMeshBackend::ESP)
+    {
+        esp_defaults = Build_ESP_Default_Selection(esp.tolerance, cutoff,
+                                                   box_length);
+        if (esp_auto_grid)
+        {
+            fftx = esp_defaults.fftx;
+            ffty = esp_defaults.ffty;
+            fftz = esp_defaults.fftz;
+            esp.grid_spacing = esp_defaults.target_grid_spacing;
+        }
+    }
 
     float grid_spacing = 1;
-    if (controller->Command_Exist(this->module_name, "grid_spacing"))
+    if (pm_grid_spacing_explicit)
     {
         controller->Check_Float(this->module_name, "grid_spacing",
                                 "Particle_Mesh::Initial");
@@ -808,6 +920,31 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
     if (ffty < 0) ffty = Get_Fft_Patameter(box_length.y / grid_spacing);
 
     if (fftz < 0) fftz = Get_Fft_Patameter(box_length.z / grid_spacing);
+
+    const float esp_effective_grid_spacing =
+        backend == ParticleMeshBackend::ESP
+            ? std::min(box_length.x / fftx,
+                       std::min(box_length.y / ffty, box_length.z / fftz))
+            : 0.0f;
+    const bool esp_auto_order =
+        backend == ParticleMeshBackend::ESP && !esp_order_explicit;
+    if (esp_auto_order)
+    {
+        esp.order = esp_defaults.order;
+        if (esp_effective_grid_spacing > 0.0f)
+        {
+            esp.order = std::max(
+                4, (int)ceilf(2.0f * esp_defaults.alpha /
+                              esp_effective_grid_spacing));
+        }
+    }
+    const bool esp_auto_bandlimit =
+        backend == ParticleMeshBackend::ESP && (esp_auto_grid || esp_auto_order);
+    if (esp_auto_bandlimit)
+    {
+        esp.c_split = esp_defaults.c_split;
+        esp.c_spread = esp_defaults.c_window;
+    }
 
     controller->printf("    fftx: %d\n", fftx);
     controller->printf("    ffty: %d\n", ffty);
@@ -935,10 +1072,30 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
         controller->printf("    ESP table mode: %s\n",
                            ESP_Table_Mode_Name(esp.table_mode));
         controller->printf("    ESP table points: %d\n", esp.table_points);
+        controller->printf("    ESP default c_split estimate: %.8e\n",
+                           esp_defaults.c_split);
+        controller->printf("    ESP default c_window estimate: %.8e\n",
+                           esp_defaults.c_window);
+        controller->printf("    ESP default alpha estimate: %.8e\n",
+                           esp_defaults.alpha);
         if (esp.grid_spacing > 0.0f)
         {
             controller->printf("    ESP grid_spacing override: %f Angstrom\n",
                                esp.grid_spacing);
+        }
+        if (esp_auto_grid)
+        {
+            controller->printf(
+                "    ESP auto grid target spacing: %f Angstrom\n",
+                esp_defaults.target_grid_spacing);
+            controller->printf(
+                "    ESP auto effective spacing: %f Angstrom\n",
+                esp_effective_grid_spacing);
+        }
+        if (esp_auto_order)
+        {
+            controller->printf("    ESP auto order from tolerance/grid: %d\n",
+                               esp.order);
         }
         ESP_PSWF_Table esp_pswf;
         try
@@ -1206,10 +1363,6 @@ void Particle_Mesh::Clear()
         Free_Single_Device_Pointer((void**)&atom_id_g_l);
         Free_Single_Device_Pointer((void**)&g_crd);
         Free_Single_Device_Pointer((void**)&g_frc);
-
-        // Free_Single_Device_Pointer((void**)&MPI_PME_Q);
-        // Free_Single_Device_Pointer((void**)&MPI_PME_FQ);
-        // Free_Single_Device_Pointer((void**)&MPI_PME_FBCFQ);
 
         Free_Single_Device_Pointer((void**)&PME_atom_near);
         Free_Single_Device_Pointer((void**)&force_backup);
@@ -1849,6 +2002,12 @@ static __global__ void PME_Excluded_Force_With_Atom_Energy_Correction(
     }
 }
 
+static void Launch_PME_Excluded_Correction(
+    Particle_Mesh* pm, const VECTOR* crd, const LTMatrix3 cell,
+    const LTMatrix3 rcell, const float* charge, const int* excluded_list_start,
+    const int* excluded_list, const int* excluded_atom_numbers, VECTOR* frc,
+    float* atom_ene, LTMatrix3* atom_virial);
+
 void Particle_Mesh::PME_Excluded_Force_With_Atom_Energy(
     const VECTOR* crd, const LTMatrix3 cell, const LTMatrix3 rcell,
     const float* charge, const int* excluded_list_start,
@@ -1861,14 +2020,10 @@ void Particle_Mesh::PME_Excluded_Force_With_Atom_Energy(
             deviceMemset(d_correction_atom_energy, 0,
                          sizeof(float) * atom_numbers);
         if (CONTROLLER::MPI_rank != 0) return;
-        Launch_Device_Kernel(
-            PME_Excluded_Force_With_Atom_Energy_Correction,
-            (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                CONTROLLER::device_max_thread,
-            CONTROLLER::device_max_thread, 0, NULL, atom_numbers, crd, cell,
-            rcell, charge, beta, Get_ESP_Direct_Parameters(),
-            excluded_list_start, excluded_list, excluded_atom_numbers, frc,
-            atom_ene, d_correction_atom_energy, atom_virial);
+        Launch_PME_Excluded_Correction(this, crd, cell, rcell, charge,
+                                       excluded_list_start, excluded_list,
+                                       excluded_atom_numbers, frc, atom_ene,
+                                       atom_virial);
     }
 }
 
@@ -1935,6 +2090,290 @@ static __global__ void PME_Sum_Virial(const int nfft,
     Warp_Sum_To(virial, vir, warpSize);
 }
 
+static __global__ void up_box_bc(int fftx, int ffty, int fftz, float* PME_BC,
+                                 float* PME_BC0, LTMatrix3* PME_virial_BC,
+                                 float mprefactor, LTMatrix3 rcell,
+                                 float volume);
+static __global__ void up_box_esp_bc(
+    int fftx, int ffty, int fftz, float* ESP_BC, const float* ESP_BC0,
+    LTMatrix3* ESP_virial_BC, LTMatrix3 rcell, float volume, float cutoff,
+    float c_split, int table_points, int split_poly_order, int use_poly,
+    const float* split_fourier_table, const float* split_fourier_coeff,
+    const float* split_fourier_derivative_table,
+    const float* split_fourier_derivative_coeff);
+static void Scale_Positions_Device(const LTMatrix3 g, VECTOR* crd, float dt);
+
+static void Launch_PME_Excluded_Correction(
+    Particle_Mesh* pm, const VECTOR* crd, const LTMatrix3 cell,
+    const LTMatrix3 rcell, const float* charge, const int* excluded_list_start,
+    const int* excluded_list, const int* excluded_atom_numbers, VECTOR* frc,
+    float* atom_ene, LTMatrix3* atom_virial)
+{
+    Launch_Device_Kernel(
+        PME_Excluded_Force_With_Atom_Energy_Correction,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->atom_numbers, crd, cell,
+        rcell, charge, pm->beta, pm->Get_ESP_Direct_Parameters(),
+        excluded_list_start, excluded_list, excluded_atom_numbers, frc,
+        atom_ene, pm->d_correction_atom_energy, atom_virial);
+}
+
+static void Run_ESP_Reciprocal_Force_Backend(
+    Particle_Mesh* pm, const VECTOR* crd, const LTMatrix3 cell,
+    const LTMatrix3 rcell, const float* charge, VECTOR* force, int need_virial,
+    LTMatrix3* d_virial, int step)
+{
+    if (step % pm->update_interval != 0)
+    {
+        return;
+    }
+
+    int use_poly = pm->esp.table_mode == ESPTableMode::POLY;
+    deviceMemset(pm->PME_Q, 0, sizeof(float) * pm->PME_Nall);
+    Launch_Device_Kernel(
+        ESP_Atom_Near,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, crd, pm->ESP_atom_near,
+        pm->PME_Nin, cell, rcell, pm->atom_numbers, pm->fftx, pm->ffty,
+        pm->fftz, pm->esp.order, pm->PME_uxyz, pm->PME_frxyz,
+        pm->force_backup);
+
+    int spread_threads_y = pm->ESP_near_grid_points;
+    if (spread_threads_y > CONTROLLER::device_max_thread)
+        spread_threads_y = CONTROLLER::device_max_thread;
+    if (spread_threads_y < 1) spread_threads_y = 1;
+    dim3 blockSize = {
+        CONTROLLER::device_max_thread / spread_threads_y,
+        (unsigned int)spread_threads_y};
+    if (blockSize.x < 1) blockSize.x = 1;
+    Launch_Device_Kernel(
+        ESP_Q_Spread, (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
+        blockSize, 0, NULL, pm->ESP_atom_near, charge, pm->PME_frxyz,
+        pm->PME_Q, pm->atom_numbers, pm->PME_Nall, pm->esp.order,
+        pm->ESP_near_grid_points, pm->esp.table_points,
+        pm->esp.spread_poly_order, use_poly, pm->ESP_window_table,
+        pm->ESP_window_coeff);
+    Launch_Device_Kernel(
+        ESP_Sanitize_Float_List,
+        (pm->PME_Nall + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->PME_Q, pm->PME_Nall);
+
+    SPONGE_FFT_WRAPPER::R2C(pm->PME_plan_r2c, pm->PME_Q, pm->PME_FQ);
+    Launch_Device_Kernel(
+        ESP_Sanitize_Complex_List,
+        (pm->PME_Nfft + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->PME_Nfft);
+
+    blockSize = {CONTROLLER::device_warp,
+                 CONTROLLER::device_max_thread / CONTROLLER::device_warp};
+    if (need_virial)
+    {
+        Launch_Device_Kernel(
+            PME_Sum_Virial,
+            (pm->PME_Nfft + 4 * CONTROLLER::device_max_thread - 1) /
+                CONTROLLER::device_max_thread,
+            blockSize, 0, NULL, pm->PME_Nfft, pm->ESP_Virial_BC, pm->PME_FQ,
+            d_virial, pm->fftz);
+    }
+
+    Launch_Device_Kernel(
+        PME_BCFQ,
+        (pm->PME_Nfft + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->ESP_BC,
+        pm->PME_Nfft);
+    Launch_Device_Kernel(
+        ESP_Sanitize_Complex_List,
+        (pm->PME_Nfft + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->PME_Nfft);
+
+    SPONGE_FFT_WRAPPER::C2R(pm->PME_plan_c2r, pm->PME_FQ, pm->PME_FBCFQ);
+    Launch_Device_Kernel(
+        ESP_Sanitize_Float_List,
+        (pm->PME_Nall + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FBCFQ, pm->PME_Nall);
+
+    blockSize = {8, CONTROLLER::device_max_thread / 8};
+    Launch_Device_Kernel(
+        ESP_Final, (pm->atom_numbers + blockSize.y - 1) / blockSize.y,
+        blockSize, 0, NULL, pm->ESP_atom_near, charge, pm->PME_FBCFQ,
+        pm->force_backup, pm->PME_frxyz, rcell, pm->fftx, pm->ffty, pm->fftz,
+        pm->atom_numbers, pm->PME_Nall, pm->esp.order, pm->ESP_near_grid_points,
+        pm->esp.table_points, pm->esp.spread_poly_order, use_poly,
+        pm->ESP_window_table, pm->ESP_window_derivative_table,
+        pm->ESP_window_coeff, pm->ESP_window_derivative_coeff);
+    Launch_Device_Kernel(
+        ESP_Sanitize_Vector_List,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->force_backup,
+        pm->atom_numbers);
+
+    Launch_Device_Kernel(
+        device_add_force,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->atom_numbers,
+        pm->update_interval, force, pm->force_backup);
+    Launch_Device_Kernel(
+        ESP_Sanitize_Vector_List,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, force, pm->atom_numbers);
+}
+
+static void Run_ESP_Reciprocal_Energy_Backend(Particle_Mesh* pm,
+                                              const float* charge,
+                                              float* d_potential)
+{
+    Launch_Device_Kernel(ESP_Energy_Product, 1, CONTROLLER::device_max_thread,
+                         0, NULL, pm->PME_Nall, pm->PME_Q, pm->PME_FBCFQ,
+                         pm->d_reciprocal_ene);
+    Scale_List(pm->d_reciprocal_ene, 0.5f, 1);
+
+    Launch_Device_Kernel(
+        charge_square_kernel,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->atom_numbers, charge,
+        pm->charge_square);
+    Sum_Of_List(pm->charge_square, pm->d_self_ene, pm->atom_numbers);
+    Scale_List(pm->d_self_ene, -pm->esp.self_energy_coeff, 1);
+
+    Launch_Device_Kernel(PME_Add_Energy_To_Potential, 1, 1, 0, NULL,
+                         d_potential, pm->d_self_ene, pm->d_reciprocal_ene);
+}
+
+static void Run_PME_Reciprocal_Force_Backend(
+    Particle_Mesh* pm, const VECTOR* crd, const LTMatrix3 cell,
+    const LTMatrix3 rcell, const float* charge, VECTOR* force, int need_virial,
+    LTMatrix3* d_virial, int step)
+{
+    if (step % pm->update_interval != 0)
+    {
+        return;
+    }
+
+    deviceMemset(pm->PME_Q, 0, sizeof(float) * pm->PME_Nall);
+    Launch_Device_Kernel(
+        PME_Atom_Near,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, crd, pm->PME_atom_near,
+        pm->PME_Nin, cell, rcell, pm->atom_numbers, pm->fftx, pm->ffty,
+        pm->fftz, pm->PME_uxyz, pm->PME_frxyz, pm->force_backup);
+
+    dim3 blockSize = {CONTROLLER::device_max_thread / 64, 64};
+    Launch_Device_Kernel(PME_Q_Spread,
+                         (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
+                         blockSize, 0, NULL, pm->PME_atom_near, charge,
+                         pm->PME_frxyz, pm->PME_Q, pm->atom_numbers,
+                         pm->PME_Nall);
+
+    SPONGE_FFT_WRAPPER::R2C(pm->PME_plan_r2c, pm->PME_Q, pm->PME_FQ);
+
+    blockSize = {CONTROLLER::device_warp,
+                 CONTROLLER::device_max_thread / CONTROLLER::device_warp};
+    if (need_virial)
+    {
+        Launch_Device_Kernel(
+            PME_Sum_Virial,
+            (pm->PME_Nfft + 4 * CONTROLLER::device_max_thread - 1) /
+                CONTROLLER::device_max_thread,
+            blockSize, 0, NULL, pm->PME_Nfft, pm->PME_Virial_BC, pm->PME_FQ,
+            d_virial, pm->fftz);
+    }
+
+    Launch_Device_Kernel(
+        PME_BCFQ,
+        (pm->PME_Nfft + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->PME_BC,
+        pm->PME_Nfft);
+
+    SPONGE_FFT_WRAPPER::C2R(pm->PME_plan_c2r, pm->PME_FQ, pm->PME_FBCFQ);
+
+    blockSize = {8, CONTROLLER::device_max_thread / 8};
+    Launch_Device_Kernel(PME_Final,
+                         (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
+                         blockSize, 0, NULL, pm->PME_atom_near, charge,
+                         pm->PME_FBCFQ, pm->force_backup, pm->PME_frxyz, rcell,
+                         pm->fftx, pm->ffty, pm->fftz, pm->atom_numbers,
+                         pm->PME_Nall);
+
+    Launch_Device_Kernel(
+        device_add_force,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->atom_numbers,
+        pm->update_interval, force, pm->force_backup);
+}
+
+static void Run_PME_Reciprocal_Energy_Backend(Particle_Mesh* pm,
+                                              const float* charge,
+                                              float* d_potential)
+{
+    Launch_Device_Kernel(PME_Energy_Product, 1, CONTROLLER::device_max_thread,
+                         0, NULL, pm->PME_Nall, pm->PME_Q, pm->PME_FBCFQ,
+                         pm->d_reciprocal_ene);
+    Scale_List(pm->d_reciprocal_ene, 0.5f, 1);
+
+    Launch_Device_Kernel(
+        charge_square_kernel,
+        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
+            CONTROLLER::device_max_thread,
+        CONTROLLER::device_max_thread, 0, NULL, pm->atom_numbers, charge,
+        pm->charge_square);
+    Sum_Of_List(pm->charge_square, pm->d_self_ene, pm->atom_numbers);
+    Scale_List(pm->d_self_ene, -pm->beta / sqrt(PI), 1);
+
+    Sum_Of_List(charge, pm->charge_sum, pm->atom_numbers);
+    Launch_Device_Kernel(device_add, 1, 1, 0, NULL, pm->d_self_ene,
+                         pm->neutralizing_factor, pm->charge_sum);
+    Launch_Device_Kernel(PME_Add_Energy_To_Potential, 1, 1, 0, NULL,
+                         d_potential, pm->d_self_ene, pm->d_reciprocal_ene);
+}
+
+static void Update_ESP_Box_Backend(Particle_Mesh* pm, LTMatrix3 rcell,
+                                   float volume)
+{
+    dim3 blockSize = {8, 8, CONTROLLER::device_max_thread / 64};
+    dim3 gridSize = {64, 64};
+    pm->neutralizing_factor = 0.0f;
+    Launch_Device_Kernel(
+        up_box_esp_bc, gridSize, blockSize, 0, NULL, pm->fftx, pm->ffty,
+        pm->fftz, pm->ESP_BC, pm->ESP_BC0, pm->ESP_Virial_BC, rcell, volume,
+        pm->esp.cutoff, pm->esp.c_split, pm->esp.table_points,
+        pm->esp.split_poly_order, pm->esp.table_mode == ESPTableMode::POLY,
+        pm->ESP_split_fourier_table, pm->ESP_split_fourier_coeff,
+        pm->ESP_split_fourier_derivative_table,
+        pm->ESP_split_fourier_derivative_coeff);
+}
+
+static void Update_PME_Box_Backend(Particle_Mesh* pm, LTMatrix3 rcell,
+                                   float volume)
+{
+    dim3 blockSize = {8, 8, CONTROLLER::device_max_thread / 64};
+    dim3 gridSize = {64, 64};
+    pm->neutralizing_factor = -0.5 * CONSTANT_Pi / (pm->beta * pm->beta * volume);
+    float mprefactor = PI * PI / -pm->beta / pm->beta;
+    Launch_Device_Kernel(up_box_bc, gridSize, blockSize, 0, NULL, pm->fftx,
+                         pm->ffty, pm->fftz, pm->PME_BC, pm->PME_BC0,
+                         pm->PME_Virial_BC, mprefactor, rcell, volume);
+}
+
+static void Scale_Box_Corners(Particle_Mesh* pm, LTMatrix3 g, float dt)
+{
+    Scale_Positions_Device(g, &pm->min_corner, dt);
+    Scale_Positions_Device(g, &pm->max_corner, dt);
+}
+
 void Particle_Mesh::PME_Reciprocal_Force_With_Energy_And_Virial(
     const VECTOR* crd, const LTMatrix3 cell, const LTMatrix3 rcell,
     const float* charge, VECTOR* force, int need_virial, int need_energy,
@@ -1949,213 +2388,20 @@ void Particle_Mesh::PME_Reciprocal_Force_With_Energy_And_Virial(
         }
         if (backend == ParticleMeshBackend::ESP)
         {
-            int use_poly = esp.table_mode == ESPTableMode::POLY;
-            if (step % update_interval == 0)
-            {
-                deviceMemset(PME_Q, 0, sizeof(float) * PME_Nall);
-                Launch_Device_Kernel(
-                    ESP_Atom_Near,
-                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, crd, ESP_atom_near,
-                    PME_Nin, cell, rcell, atom_numbers, fftx, ffty, fftz,
-                    esp.order, PME_uxyz, PME_frxyz, force_backup);
-
-                int spread_threads_y = ESP_near_grid_points;
-                if (spread_threads_y > CONTROLLER::device_max_thread)
-                    spread_threads_y = CONTROLLER::device_max_thread;
-                if (spread_threads_y < 1) spread_threads_y = 1;
-                dim3 blockSize = {
-                    CONTROLLER::device_max_thread / spread_threads_y,
-                    (unsigned int)spread_threads_y};
-                if (blockSize.x < 1) blockSize.x = 1;
-                Launch_Device_Kernel(
-                    ESP_Q_Spread,
-                    (atom_numbers + blockSize.x - 1) / blockSize.x, blockSize,
-                    0, NULL, ESP_atom_near, charge, PME_frxyz, PME_Q,
-                    atom_numbers, PME_Nall, esp.order, ESP_near_grid_points,
-                    esp.table_points, esp.spread_poly_order, use_poly,
-                    ESP_window_table, ESP_window_coeff);
-                Launch_Device_Kernel(
-                    ESP_Sanitize_Float_List,
-                    (PME_Nall + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, PME_Q, PME_Nall);
-
-                SPONGE_FFT_WRAPPER::R2C(PME_plan_r2c, PME_Q, PME_FQ);
-                Launch_Device_Kernel(
-                    ESP_Sanitize_Complex_List,
-                    (PME_Nfft + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, PME_FQ, PME_Nfft);
-
-                blockSize = {
-                    CONTROLLER::device_warp,
-                    CONTROLLER::device_max_thread / CONTROLLER::device_warp};
-                if (need_virial)
-                {
-                    Launch_Device_Kernel(
-                        PME_Sum_Virial,
-                        (PME_Nfft + 4 * CONTROLLER::device_max_thread - 1) /
-                            CONTROLLER::device_max_thread,
-                        blockSize, 0, NULL, PME_Nfft, ESP_Virial_BC, PME_FQ,
-                        d_virial, fftz);
-                }
-
-                Launch_Device_Kernel(
-                    PME_BCFQ,
-                    (PME_Nfft + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, PME_FQ, ESP_BC,
-                    PME_Nfft);
-                Launch_Device_Kernel(
-                    ESP_Sanitize_Complex_List,
-                    (PME_Nfft + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, PME_FQ, PME_Nfft);
-
-                SPONGE_FFT_WRAPPER::C2R(PME_plan_c2r, PME_FQ, PME_FBCFQ);
-                Launch_Device_Kernel(
-                    ESP_Sanitize_Float_List,
-                    (PME_Nall + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, PME_FBCFQ,
-                    PME_Nall);
-
-                blockSize = {8, CONTROLLER::device_max_thread / 8};
-                Launch_Device_Kernel(
-                    ESP_Final, (atom_numbers + blockSize.y - 1) / blockSize.y,
-                    blockSize, 0, NULL, ESP_atom_near, charge, PME_FBCFQ,
-                    force_backup, PME_frxyz, rcell, fftx, ffty, fftz,
-                    atom_numbers, PME_Nall, esp.order, ESP_near_grid_points,
-                    esp.table_points, esp.spread_poly_order, use_poly,
-                    ESP_window_table, ESP_window_derivative_table,
-                    ESP_window_coeff, ESP_window_derivative_coeff);
-                Launch_Device_Kernel(
-                    ESP_Sanitize_Vector_List,
-                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, force_backup,
-                    atom_numbers);
-
-                Launch_Device_Kernel(
-                    device_add_force,
-                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, atom_numbers,
-                    update_interval, force, force_backup);
-                Launch_Device_Kernel(
-                    ESP_Sanitize_Vector_List,
-                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, force,
-                    atom_numbers);
-            }
+            Run_ESP_Reciprocal_Force_Backend(this, crd, cell, rcell, charge,
+                                             force, need_virial, d_virial,
+                                             step);
             if (need_energy)
             {
-                Launch_Device_Kernel(
-                    ESP_Energy_Product, 1, CONTROLLER::device_max_thread, 0,
-                    NULL, PME_Nall, PME_Q, PME_FBCFQ, d_reciprocal_ene);
-                Scale_List(d_reciprocal_ene, 0.5f, 1);
-
-                Launch_Device_Kernel(
-                    charge_square_kernel,
-                    (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    CONTROLLER::device_max_thread, 0, NULL, atom_numbers,
-                    charge, charge_square);
-                Sum_Of_List(charge_square, d_self_ene, atom_numbers);
-                Scale_List(d_self_ene, -esp.self_energy_coeff, 1);
-
-                Launch_Device_Kernel(PME_Add_Energy_To_Potential, 1, 1, 0, NULL,
-                                     d_potential, d_self_ene, d_reciprocal_ene);
+                Run_ESP_Reciprocal_Energy_Backend(this, charge, d_potential);
             }
             return;
         }
-        if (step % update_interval == 0)
-        {
-            // 计算插值索引
-            deviceMemset(PME_Q, 0, sizeof(float) * PME_Nall);
-            Launch_Device_Kernel(
-                PME_Atom_Near,
-                (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                    CONTROLLER::device_max_thread,
-                CONTROLLER::device_max_thread, 0, NULL, crd, PME_atom_near,
-                PME_Nin, cell, rcell, atom_numbers, fftx, ffty, fftz, PME_uxyz,
-                PME_frxyz, force_backup);
-
-            dim3 blockSize = {CONTROLLER::device_max_thread / 64, 64};
-
-            // 电荷Bspline插值
-            Launch_Device_Kernel(PME_Q_Spread,
-                                 (atom_numbers + blockSize.x - 1) / blockSize.x,
-                                 blockSize, 0, NULL, PME_atom_near, charge,
-                                 PME_frxyz, PME_Q, atom_numbers, PME_Nall);
-
-            // do FFT
-            SPONGE_FFT_WRAPPER::R2C(PME_plan_r2c, PME_Q, PME_FQ);
-
-            // 修正Bspline插值
-            blockSize = {
-                CONTROLLER::device_warp,
-                CONTROLLER::device_max_thread / CONTROLLER::device_warp};
-            if (need_virial)
-                Launch_Device_Kernel(
-                    PME_Sum_Virial,
-                    (PME_Nfft + 4 * CONTROLLER::device_max_thread - 1) /
-                        CONTROLLER::device_max_thread,
-                    blockSize, 0, NULL, PME_Nfft, PME_Virial_BC, PME_FQ,
-                    d_virial, fftz);
-
-            Launch_Device_Kernel(
-                PME_BCFQ,
-                (PME_Nfft + CONTROLLER::device_max_thread - 1) /
-                    CONTROLLER::device_max_thread,
-                CONTROLLER::device_max_thread, 0, NULL, PME_FQ, PME_BC,
-                PME_Nfft);
-
-            // do inverse FFT
-            SPONGE_FFT_WRAPPER::C2R(PME_plan_c2r, PME_FQ, PME_FBCFQ);
-
-            // 计算势能和力
-            blockSize = {8, CONTROLLER::device_max_thread / 8};
-            Launch_Device_Kernel(PME_Final,
-                                 (atom_numbers + blockSize.x - 1) / blockSize.x,
-                                 blockSize, 0, NULL, PME_atom_near, charge,
-                                 PME_FBCFQ, force_backup, PME_frxyz, rcell,
-                                 fftx, ffty, fftz, atom_numbers, PME_Nall);
-
-            Launch_Device_Kernel(
-                device_add_force,
-                (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                    CONTROLLER::device_max_thread,
-                CONTROLLER::device_max_thread, 0, NULL, atom_numbers,
-                update_interval, force, force_backup);
-        }
+        Run_PME_Reciprocal_Force_Backend(this, crd, cell, rcell, charge, force,
+                                         need_virial, d_virial, step);
         if (need_energy)
         {
-            Launch_Device_Kernel(PME_Energy_Product, 1,
-                                 CONTROLLER::device_max_thread, 0, NULL,
-                                 PME_Nall, PME_Q, PME_FBCFQ, d_reciprocal_ene);
-            Scale_List(d_reciprocal_ene, 0.5f, 1);
-
-            Launch_Device_Kernel(
-                charge_square_kernel,
-                (atom_numbers + CONTROLLER::device_max_thread - 1) /
-                    CONTROLLER::device_max_thread,
-                CONTROLLER::device_max_thread, 0, NULL, atom_numbers, charge,
-                charge_square);
-            Sum_Of_List(charge_square, d_self_ene, atom_numbers);
-
-            Scale_List(d_self_ene, -beta / sqrt(PI), 1);
-
-            Sum_Of_List(charge, charge_sum, atom_numbers);
-
-            Launch_Device_Kernel(device_add, 1, 1, 0, NULL, d_self_ene,
-                                 neutralizing_factor, charge_sum);
-
-            Launch_Device_Kernel(PME_Add_Energy_To_Potential, 1, 1, 0, NULL,
-                                 d_potential, d_self_ene, d_reciprocal_ene);
+            Run_PME_Reciprocal_Energy_Backend(this, charge, d_potential);
         }
     }
 }
@@ -2354,29 +2600,14 @@ void Particle_Mesh::Update_Box(LTMatrix3 cell, LTMatrix3 rcell, LTMatrix3 g,
                                float dt)
 {
     float volume = cell.a11 * cell.a22 * cell.a33;
-    dim3 blockSize = {8, 8, CONTROLLER::device_max_thread / 64};
-    dim3 gridSize = {64, 64};
     if (backend == ParticleMeshBackend::ESP)
     {
-        neutralizing_factor = 0.0f;
-        Launch_Device_Kernel(
-            up_box_esp_bc, gridSize, blockSize, 0, NULL, fftx, ffty, fftz,
-            ESP_BC, ESP_BC0, ESP_Virial_BC, rcell, volume, esp.cutoff,
-            esp.c_split, esp.table_points, esp.split_poly_order,
-            esp.table_mode == ESPTableMode::POLY, ESP_split_fourier_table,
-            ESP_split_fourier_coeff, ESP_split_fourier_derivative_table,
-            ESP_split_fourier_derivative_coeff);
-        Scale_Positions_Device(g, &min_corner, dt);
-        Scale_Positions_Device(g, &max_corner, dt);
+        Update_ESP_Box_Backend(this, rcell, volume);
+        Scale_Box_Corners(this, g, dt);
         return;
     }
-    neutralizing_factor = -0.5 * CONSTANT_Pi / (beta * beta * volume);
-    float mprefactor = PI * PI / -beta / beta;
-    Launch_Device_Kernel(up_box_bc, gridSize, blockSize, 0, NULL, fftx, ffty,
-                         fftz, PME_BC, PME_BC0, PME_Virial_BC, mprefactor,
-                         rcell, volume);
-    Scale_Positions_Device(g, &min_corner, dt);
-    Scale_Positions_Device(g, &max_corner, dt);
+    Update_PME_Box_Backend(this, rcell, volume);
+    Scale_Box_Corners(this, g, dt);
 }
 
 //-------domain-decomposition and communication----------------

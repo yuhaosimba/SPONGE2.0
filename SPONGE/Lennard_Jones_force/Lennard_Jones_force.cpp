@@ -2,7 +2,6 @@
 
 #include "../xponge/load/native/lj.hpp"
 #include "../xponge/xponge.h"
-// #include "assert.h"
 
 // 由LJ坐标和转化系数求距离
 __global__ void Copy_LJ_Type_To_New_Crd(const int atom_numbers,
@@ -58,6 +57,44 @@ static __global__ void ESP_Sanitize_LJ_Direct_Energy(
     }
 }
 
+static __device__ __host__ __forceinline__ float Evaluate_Direct_Coulomb_Force(
+    VECTOR_LJ r1, VECTOR_LJ r2, float dr_abs, float pme_beta,
+    const ESP_Direct_Parameters& esp_direct)
+{
+    if (esp_direct.enabled)
+    {
+        return ESP_Get_Direct_Coulomb_Force(r1.charge * r2.charge, dr_abs,
+                                            esp_direct);
+    }
+    return Get_Direct_Coulomb_Force(r1, r2, dr_abs, pme_beta);
+}
+
+static __device__ __host__ __forceinline__ float
+Evaluate_Direct_Coulomb_Energy(VECTOR_LJ r1, VECTOR_LJ r2, float dr_abs,
+                               float pme_beta,
+                               const ESP_Direct_Parameters& esp_direct)
+{
+    if (esp_direct.enabled)
+    {
+        return ESP_Get_Direct_Coulomb_Energy(r1.charge * r2.charge, dr_abs,
+                                             esp_direct);
+    }
+    return Get_Direct_Coulomb_Energy(r1, r2, dr_abs, pme_beta);
+}
+
+static __device__ __host__ __forceinline__ int
+Direct_Coulomb_Force_Is_Usable(float force, const ESP_Direct_Parameters& esp_direct)
+{
+    return !esp_direct.enabled || ESP_Float_Is_Bounded(force, 1.0e6f);
+}
+
+static __device__ __host__ __forceinline__ int
+Direct_Coulomb_Energy_Is_Usable(float energy,
+                                const ESP_Direct_Parameters& esp_direct)
+{
+    return !esp_direct.enabled || ESP_Float_Is_Bounded(energy, 1.0e4f);
+}
+
 template <bool need_force, bool need_energy, bool need_virial,
           bool need_coulomb>
 static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
@@ -110,14 +147,10 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                     float frc_abs = Get_LJ_Force(r1, r2, dr_abs, A, B);
                     if (need_coulomb)
                     {
-                        float frc_cf_abs =
-                            esp_direct.enabled
-                                ? ESP_Get_Direct_Coulomb_Force(
-                                      r1.charge * r2.charge, dr_abs, esp_direct)
-                                : Get_Direct_Coulomb_Force(r1, r2, dr_abs,
-                                                           pme_beta);
-                        if (esp_direct.enabled &&
-                            !ESP_Float_Is_Bounded(frc_cf_abs, 1.0e6f))
+                        float frc_cf_abs = Evaluate_Direct_Coulomb_Force(
+                            r1, r2, dr_abs, pme_beta, esp_direct);
+                        if (!Direct_Coulomb_Force_Is_Usable(frc_cf_abs,
+                                                            esp_direct))
                         {
                             frc_cf_abs = 0.0f;
                         }
@@ -141,14 +174,10 @@ static __global__ void Lennard_Jones_And_Direct_Coulomb_Device(
                         ij_factor * Get_LJ_Energy(r1, r2, dr_abs, A, B);
                     if (need_coulomb)
                     {
-                        float coulomb_energy =
-                            esp_direct.enabled
-                                ? ESP_Get_Direct_Coulomb_Energy(
-                                      r1.charge * r2.charge, dr_abs, esp_direct)
-                                : Get_Direct_Coulomb_Energy(r1, r2, dr_abs,
-                                                            pme_beta);
-                        if (!esp_direct.enabled ||
-                            ESP_Float_Is_Bounded(coulomb_energy, 1.0e4f))
+                        float coulomb_energy = Evaluate_Direct_Coulomb_Energy(
+                            r1, r2, dr_abs, pme_beta, esp_direct);
+                        if (Direct_Coulomb_Energy_Is_Usable(coulomb_energy,
+                                                            esp_direct))
                         {
                             energy_coulomb += ij_factor * coulomb_energy;
                         }
