@@ -161,7 +161,6 @@ struct Particle_Mesh
     int ESP_window_coeff_size = 0;
     int ESP_scalar_table_size = 0;
     int ESP_scalar_coeff_size = 0;
-    int* ESP_atom_near = NULL;
     float* ESP_window_table = NULL;
     float* ESP_window_derivative_table = NULL;
     float* ESP_window_coeff = NULL;

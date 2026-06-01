@@ -25,6 +25,12 @@ static __device__ float PME_Md[4] = {0, 1.0 / 6.0, 4.0 / 6.0, 1.0 / 6.0};
 static __device__ float PME_dMa[4] = {0.5, -1.5, 1.5, -0.5};
 static __device__ float PME_dMb[4] = {0, 1, -2, 1};
 static __device__ float PME_dMc[4] = {0, 0.5, 0, -0.5};
+static constexpr int ESP_ORDER5 = 5;
+static constexpr int ESP_ORDER5_SUPPORT = 125;
+static constexpr int ESP_GPU_SPREAD_LANES_PER_ATOM = 32;
+static constexpr int ESP_GPU_SPREAD_ATOMS_PER_BLOCK = 4;
+static constexpr int ESP_GPU_FINAL_LANES_PER_ATOM = 8;
+static constexpr int ESP_GPU_FINAL_ATOMS_PER_BLOCK = 128;
 
 struct ESP_Default_Selection
 {
@@ -38,6 +44,13 @@ struct ESP_Default_Selection
     int fftz = 0;
     int order = 0;
 };
+
+static int ESP_Default_Order_Gromacs_Style(float tolerance)
+{
+    if (tolerance <= 1.0e-5f) return 6;
+    if (tolerance <= 1.0e-4f) return 5;
+    return 4;
+}
 
 static float ESP_Default_Box_Length_Reference(VECTOR box_length)
 {
@@ -113,8 +126,7 @@ static ESP_Default_Selection Build_ESP_Default_Selection(float tolerance,
         std::min(box_length.x / selection.fftx,
                  std::min(box_length.y / selection.ffty,
                           box_length.z / selection.fftz));
-    selection.order = std::max(
-        4, (int)ceilf(2.0f * selection.alpha / selection.effective_grid_spacing));
+    selection.order = ESP_Default_Order_Gromacs_Style(clamped_tolerance);
     return selection;
 }
 
@@ -541,12 +553,6 @@ static void Allocate_ESP_PSWF_Buffers(Particle_Mesh* pme,
     pme->ESP_scalar_table_size = pswf_table.table_points;
     pme->ESP_scalar_coeff_size = pswf_table.split_poly_order;
 
-    Device_Malloc_Safely(
-        (void**)&pme->ESP_atom_near,
-        sizeof(int) * pme->ESP_near_grid_points * pme->atom_numbers);
-    deviceMemset(pme->ESP_atom_near, 0,
-                 sizeof(int) * pme->ESP_near_grid_points * pme->atom_numbers);
-
     ESP_Upload_Float_Vector(&pme->ESP_window_table,
                             pswf_table.spread_window_table);
     ESP_Upload_Float_Vector(&pme->ESP_window_derivative_table,
@@ -931,12 +937,6 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
     if (esp_auto_order)
     {
         esp.order = esp_defaults.order;
-        if (esp_effective_grid_spacing > 0.0f)
-        {
-            esp.order = std::max(
-                4, (int)ceilf(2.0f * esp_defaults.alpha /
-                              esp_effective_grid_spacing));
-        }
     }
     const bool esp_auto_bandlimit =
         backend == ParticleMeshBackend::ESP && (esp_auto_grid || esp_auto_order);
@@ -1332,7 +1332,6 @@ void Particle_Mesh::Clear()
         Free_Single_Device_Pointer((void**)&PME_BC);
         Free_Single_Device_Pointer((void**)&PME_Virial_BC);
         Free_Single_Device_Pointer((void**)&PME_BC0);
-        Free_Single_Device_Pointer((void**)&ESP_atom_near);
         Free_Single_Device_Pointer((void**)&ESP_window_table);
         Free_Single_Device_Pointer((void**)&ESP_window_derivative_table);
         Free_Single_Device_Pointer((void**)&ESP_window_coeff);
@@ -1686,11 +1685,77 @@ static __device__ __forceinline__ void ESP_Decompose_Window_Index(
     *kz = k - (*kx) * order2 - (*ky) * order;
 }
 
-// ESP动态支持宽度版本：每个原子附近的网格点数为 order^3。
+static __device__ __forceinline__ int ESP_Wrap_Subtract_Index(int base, int delta,
+                                                              int n)
+{
+    int value = base - delta;
+    if (value < 0) value += n;
+    if (value >= n) value -= n;
+    return value;
+}
+
+static __device__ __forceinline__ int ESP_Get_Grid_Index(
+    const UNSIGNED_INT_VECTOR& uxyz, int kx, int ky, int kz, int fftx, int ffty,
+    int fftz, int PME_Nin)
+{
+    int ix = ESP_Wrap_Subtract_Index(uxyz.uint_x, kx, fftx);
+    int iy = ESP_Wrap_Subtract_Index(uxyz.uint_y, ky, ffty);
+    int iz = ESP_Wrap_Subtract_Index(uxyz.uint_z, kz, fftz);
+    return ix * PME_Nin + iy * fftz + iz;
+}
+
+static __device__ __forceinline__ void ESP_Fill_Window_Cache_1D(
+    const float* window_table, const float* window_coeff, const int table_points,
+    const int poly_order, const int use_poly, const int order,
+    const VECTOR& temp_frxyz, float* wx, float* wy, float* wz)
+{
+    for (int i = 0; i < order; i++)
+    {
+        wx[i] = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.x);
+        wy[i] = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.y);
+        wz[i] = ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.z);
+    }
+}
+
+static __device__ __forceinline__ void ESP_Fill_Window_Derivative_Cache_1D(
+    const float* window_derivative_table,
+    const float* window_derivative_coeff, const int table_points,
+    const int poly_order, const int use_poly, const int order,
+    const VECTOR& temp_frxyz, float* dwx, float* dwy, float* dwz)
+{
+    for (int i = 0; i < order; i++)
+    {
+        dwx[i] = ESP_Eval_Window(window_derivative_table,
+                                 window_derivative_coeff, table_points,
+                                 poly_order, use_poly, i, temp_frxyz.x);
+        dwy[i] = ESP_Eval_Window(window_derivative_table,
+                                 window_derivative_coeff, table_points,
+                                 poly_order, use_poly, i, temp_frxyz.y);
+        dwz[i] = ESP_Eval_Window(window_derivative_table,
+                                 window_derivative_coeff, table_points,
+                                 poly_order, use_poly, i, temp_frxyz.z);
+    }
+}
+
+static __device__ __forceinline__ void ESP_Fill_Wrapped_Index_Cache_1D(
+    const UNSIGNED_INT_VECTOR& uxyz, const int order, const int fftx,
+    const int ffty, const int fftz, int* ix, int* iy, int* iz)
+{
+    for (int i = 0; i < order; i++)
+    {
+        ix[i] = ESP_Wrap_Subtract_Index(uxyz.uint_x, i, fftx);
+        iy[i] = ESP_Wrap_Subtract_Index(uxyz.uint_y, i, ffty);
+        iz[i] = ESP_Wrap_Subtract_Index(uxyz.uint_z, i, fftz);
+    }
+}
+
+// ESP动态支持宽度版本：准备原子分数坐标、基网格点与备份力。
 static __global__ void ESP_Atom_Near(
-    const VECTOR* crd, int* ESP_atom_near, const int PME_Nin,
-    const LTMatrix3 cell, const LTMatrix3 rcell, const int atom_numbers,
-    const int fftx, const int ffty, const int fftz, const int order,
+    const VECTOR* crd, const LTMatrix3 cell, const LTMatrix3 rcell,
+    const int atom_numbers, const int fftx, const int ffty, const int fftz,
     UNSIGNED_INT_VECTOR* PME_uxyz, VECTOR* PME_frxyz, VECTOR* force_backup)
 {
     SIMPLE_DEVICE_FOR(atom, atom_numbers)
@@ -1724,52 +1789,163 @@ static __global__ void ESP_Atom_Near(
         PME_frxyz[atom].z = frac_crd.z - tempuz;
         PME_frxyz[atom].z = PME_frxyz[atom].z - floorf(PME_frxyz[atom].z);
 
-        if (tempux != (*temp_uxyz).uint_x || tempuy != (*temp_uxyz).uint_y ||
-            tempuz != (*temp_uxyz).uint_z)
-        {
-            (*temp_uxyz).uint_x = tempux;
-            (*temp_uxyz).uint_y = tempuy;
-            (*temp_uxyz).uint_z = tempuz;
-            int support = order * order * order;
-            int* temp_near = ESP_atom_near + atom * support;
-            for (int k = 0; k < support; k++)
-            {
-                int kx, ky, kz;
-                ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
-
-                kx = tempux - kx;
-                if (kx < 0) kx += fftx;
-                if (kx >= fftx) kx -= fftx;
-
-                ky = tempuy - ky;
-                if (ky < 0) ky += ffty;
-                if (ky >= ffty) ky -= ffty;
-
-                kz = tempuz - kz;
-                if (kz < 0) kz += fftz;
-                if (kz >= fftz) kz -= fftz;
-
-                temp_near[k] = kx * PME_Nin + ky * fftz + kz;
-            }
-        }
+        (*temp_uxyz).uint_x = tempux;
+        (*temp_uxyz).uint_y = tempuy;
+        (*temp_uxyz).uint_z = tempuz;
     }
 }
 
 // ESP/PSWF电荷分配：分离变量 W(x)W(y)W(z)，支持poly或table模式。
-static __global__ void ESP_Q_Spread(
-    int* ESP_atom_near, const float* charge, const VECTOR* PME_frxyz,
-    float* PME_Q, const int atom_numbers, const int PME_Nall, const int order,
-    const int support, const int table_points, const int poly_order,
+static __global__ void ESP_Q_Spread_Order5(
+    const UNSIGNED_INT_VECTOR* PME_uxyz, const float* charge,
+    const VECTOR* PME_frxyz, float* PME_Q, const int atom_numbers,
+    const int PME_Nin, const int PME_Nall, const int fftx, const int ffty,
+    const int fftz, const int table_points, const int poly_order,
     const int use_poly, const float* window_table, const float* window_coeff)
 {
-#ifdef USE_GPU
+#ifdef GPU_ARCH_NAME
+    int atoms_per_block = blockDim.x / ESP_GPU_SPREAD_LANES_PER_ATOM;
+    int atom_local = threadIdx.x / ESP_GPU_SPREAD_LANES_PER_ATOM;
+    int lane = threadIdx.x % ESP_GPU_SPREAD_LANES_PER_ATOM;
+    int atom = atoms_per_block * blockIdx.x + atom_local;
+    bool atom_valid = atom < atom_numbers;
+    extern __shared__ unsigned char sm_buffer[];
+    float* sm_wx = reinterpret_cast<float*>(sm_buffer);
+    float* sm_wy = sm_wx + atoms_per_block * ESP_ORDER5;
+    float* sm_wz = sm_wy + atoms_per_block * ESP_ORDER5;
+    int* sm_ix = reinterpret_cast<int*>(sm_wz + atoms_per_block * ESP_ORDER5);
+    int* sm_iy = sm_ix + atoms_per_block * ESP_ORDER5;
+    int* sm_iz = sm_iy + atoms_per_block * ESP_ORDER5;
+    if (atom_valid && lane < ESP_ORDER5)
+    {
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
+        int cache_offset = atom_local * ESP_ORDER5 + lane;
+        sm_wx[cache_offset] =
+            ESP_Eval_Window(window_table, window_coeff, table_points,
+                            poly_order, use_poly, lane, temp_frxyz.x);
+        sm_wy[cache_offset] =
+            ESP_Eval_Window(window_table, window_coeff, table_points,
+                            poly_order, use_poly, lane, temp_frxyz.y);
+        sm_wz[cache_offset] =
+            ESP_Eval_Window(window_table, window_coeff, table_points,
+                            poly_order, use_poly, lane, temp_frxyz.z);
+        sm_ix[cache_offset] =
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_x, lane, fftx);
+        sm_iy[cache_offset] =
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_y, lane, ffty);
+        sm_iz[cache_offset] =
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_z, lane, fftz);
+    }
+    deviceSyncWarp(FULL_MASK);
+    if (atom_valid)
+    {
+        int cache_offset = atom_local * ESP_ORDER5;
+        float tempcharge = charge[atom];
+        for (int linear = lane; linear < ESP_ORDER5_SUPPORT;
+             linear += ESP_GPU_SPREAD_LANES_PER_ATOM)
+        {
+            int kx = linear / 25;
+            int rem = linear - kx * 25;
+            int ky = rem / ESP_ORDER5;
+            int kz = rem - ky * ESP_ORDER5;
+            int near_index = sm_ix[cache_offset + kx] * PME_Nin +
+                             sm_iy[cache_offset + ky] * fftz +
+                             sm_iz[cache_offset + kz];
+            if ((unsigned int)near_index < (unsigned int)PME_Nall)
+            {
+                atomicAdd(&PME_Q[near_index],
+                          tempcharge * sm_wx[cache_offset + kx] *
+                              sm_wy[cache_offset + ky] *
+                              sm_wz[cache_offset + kz]);
+            }
+        }
+    }
+#else
     SIMPLE_DEVICE_FOR(atom, atom_numbers)
+    {
+        float wx[ESP_ORDER5], wy[ESP_ORDER5], wz[ESP_ORDER5];
+        int ix[ESP_ORDER5], iy[ESP_ORDER5], iz[ESP_ORDER5];
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
+        ESP_Fill_Window_Cache_1D(window_table, window_coeff, table_points,
+                                 poly_order, use_poly, ESP_ORDER5, temp_frxyz,
+                                 wx, wy, wz);
+        ESP_Fill_Wrapped_Index_Cache_1D(temp_uxyz, ESP_ORDER5, fftx, ffty,
+                                        fftz, ix, iy, iz);
+        float tempcharge = charge[atom];
+        for (int kx = 0; kx < ESP_ORDER5; kx++)
+        {
+            float charge_x = tempcharge * wx[kx];
+            int base_x = ix[kx] * PME_Nin;
+            for (int ky = 0; ky < ESP_ORDER5; ky++)
+            {
+                float charge_xy = charge_x * wy[ky];
+                int base_xy = base_x + iy[ky] * fftz;
+                for (int kz = 0; kz < ESP_ORDER5; kz++)
+                {
+                    int near_index = base_xy + iz[kz];
+                    if ((unsigned int)near_index < (unsigned int)PME_Nall)
+                    {
+                        atomicAdd(&PME_Q[near_index], charge_xy * wz[kz]);
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
+// ESP/PSWF电荷分配：分离变量 W(x)W(y)W(z)，支持poly或table模式。
+static __global__ void ESP_Q_Spread(
+    const UNSIGNED_INT_VECTOR* PME_uxyz, const float* charge,
+    const VECTOR* PME_frxyz, float* PME_Q, const int atom_numbers,
+    const int PME_Nin, const int PME_Nall, const int fftx, const int ffty,
+    const int fftz, const int order, const int support, const int table_points,
+    const int poly_order, const int use_poly, const float* window_table,
+    const float* window_coeff)
+{
+#ifdef GPU_ARCH_NAME
+    int atom = blockDim.x * blockIdx.x + threadIdx.x;
+    bool atom_valid = atom < atom_numbers;
+    extern __shared__ float sm_window_cache[];
+    float* sm_wx = sm_window_cache;
+    float* sm_wy = sm_wx + blockDim.x * order;
+    float* sm_wz = sm_wy + blockDim.x * order;
+    if (atom_valid)
+    {
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        int cache_offset = threadIdx.x * order;
+        for (int i = threadIdx.y; i < order; i = i + blockDim.y)
+        {
+            sm_wx[cache_offset + i] =
+                ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.x);
+            sm_wy[cache_offset + i] =
+                ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.y);
+            sm_wz[cache_offset + i] =
+                ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.z);
+        }
+    }
+    __syncthreads();
+    if (atom_valid)
 #else
     for (int atom = 0; atom < atom_numbers; atom++)
 #endif
     {
-        int* temp_near = ESP_atom_near + atom * support;
+#ifndef GPU_ARCH_NAME
+        std::vector<float> wx_cache(order), wy_cache(order), wz_cache(order);
         VECTOR temp_frxyz = PME_frxyz[atom];
+        ESP_Fill_Window_Cache_1D(window_table, window_coeff, table_points,
+                                 poly_order, use_poly, order, temp_frxyz,
+                                 wx_cache.data(), wy_cache.data(),
+                                 wz_cache.data());
+#else
+        int cache_offset = threadIdx.x * order;
+#endif
+        UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
         float tempcharge = charge[atom];
 #ifdef USE_GPU
         for (int k = threadIdx.y; k < support; k = k + blockDim.y)
@@ -1779,13 +1955,17 @@ static __global__ void ESP_Q_Spread(
         {
             int kx, ky, kz;
             ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
-            float wx = ESP_Eval_Window(window_table, window_coeff, table_points,
-                                       poly_order, use_poly, kx, temp_frxyz.x);
-            float wy = ESP_Eval_Window(window_table, window_coeff, table_points,
-                                       poly_order, use_poly, ky, temp_frxyz.y);
-            float wz = ESP_Eval_Window(window_table, window_coeff, table_points,
-                                       poly_order, use_poly, kz, temp_frxyz.z);
-            int near_index = temp_near[k];
+#ifdef GPU_ARCH_NAME
+            float wx = sm_wx[cache_offset + kx];
+            float wy = sm_wy[cache_offset + ky];
+            float wz = sm_wz[cache_offset + kz];
+#else
+            float wx = wx_cache[kx];
+            float wy = wy_cache[ky];
+            float wz = wz_cache[kz];
+#endif
+            int near_index = ESP_Get_Grid_Index(temp_uxyz, kx, ky, kz, fftx,
+                                                ffty, fftz, PME_Nin);
             if ((unsigned int)near_index < (unsigned int)PME_Nall)
             {
                 atomicAdd(&PME_Q[near_index], tempcharge * wx * wy * wz);
@@ -1795,57 +1975,314 @@ static __global__ void ESP_Q_Spread(
 }
 
 // ESP/PSWF gather：使用 dW/dx, dW/dy, dW/dz 得到 reciprocal force。
-static __global__ void ESP_Final(
-    int* ESP_atom_near, const float* charge, const float* PME_Q, VECTOR* force,
-    const VECTOR* PME_frxyz, const LTMatrix3 rcell, const int fftx,
-    const int ffty, const int fftz, const int atom_numbers, const int PME_Nall,
-    const int order, const int support, const int table_points,
+static __global__ void ESP_Final_Order5(
+    const UNSIGNED_INT_VECTOR* PME_uxyz, const float* charge, const float* PME_Q,
+    VECTOR* force, const VECTOR* PME_frxyz, const LTMatrix3 rcell,
+    const int fftx, const int ffty, const int fftz, const int atom_numbers,
+    const int PME_Nin, const int PME_Nall, const int table_points,
     const int poly_order, const int use_poly, const float* window_table,
     const float* window_derivative_table, const float* window_coeff,
     const float* window_derivative_coeff)
 {
 #ifdef GPU_ARCH_NAME
+    int atoms_per_block = blockDim.x / ESP_GPU_FINAL_LANES_PER_ATOM;
+    int atom_local = threadIdx.x / ESP_GPU_FINAL_LANES_PER_ATOM;
+    int lane = threadIdx.x % ESP_GPU_FINAL_LANES_PER_ATOM;
+    int atom = atoms_per_block * blockIdx.x + atom_local;
+    bool atom_valid = atom < atom_numbers;
+    extern __shared__ unsigned char sm_buffer[];
+    float* sm_wx = reinterpret_cast<float*>(sm_buffer);
+    float* sm_wy = sm_wx + atoms_per_block * ESP_ORDER5;
+    float* sm_wz = sm_wy + atoms_per_block * ESP_ORDER5;
+    float* sm_dwx = sm_wz + atoms_per_block * ESP_ORDER5;
+    float* sm_dwy = sm_dwx + atoms_per_block * ESP_ORDER5;
+    float* sm_dwz = sm_dwy + atoms_per_block * ESP_ORDER5;
+    int* sm_ix = reinterpret_cast<int*>(sm_dwz + atoms_per_block * ESP_ORDER5);
+    int* sm_iy = sm_ix + atoms_per_block * ESP_ORDER5;
+    int* sm_iz = sm_iy + atoms_per_block * ESP_ORDER5;
+    if (atom_valid && lane < ESP_ORDER5)
+    {
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
+        int cache_offset = atom_local * ESP_ORDER5 + lane;
+        sm_wx[cache_offset] =
+            ESP_Eval_Window(window_table, window_coeff, table_points,
+                            poly_order, use_poly, lane, temp_frxyz.x);
+        sm_wy[cache_offset] =
+            ESP_Eval_Window(window_table, window_coeff, table_points,
+                            poly_order, use_poly, lane, temp_frxyz.y);
+        sm_wz[cache_offset] =
+            ESP_Eval_Window(window_table, window_coeff, table_points,
+                            poly_order, use_poly, lane, temp_frxyz.z);
+        sm_dwx[cache_offset] =
+            ESP_Eval_Window(window_derivative_table, window_derivative_coeff,
+                            table_points, poly_order, use_poly, lane,
+                            temp_frxyz.x);
+        sm_dwy[cache_offset] =
+            ESP_Eval_Window(window_derivative_table, window_derivative_coeff,
+                            table_points, poly_order, use_poly, lane,
+                            temp_frxyz.y);
+        sm_dwz[cache_offset] =
+            ESP_Eval_Window(window_derivative_table, window_derivative_coeff,
+                            table_points, poly_order, use_poly, lane,
+                            temp_frxyz.z);
+        sm_ix[cache_offset] =
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_x, lane, fftx);
+        sm_iy[cache_offset] =
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_y, lane, ffty);
+        sm_iz[cache_offset] =
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_z, lane, fftz);
+    }
+    deviceSyncWarp(FULL_MASK);
+    if (atom_valid)
+    {
+        int cache_offset = atom_local * ESP_ORDER5;
+        float temp_charge = charge[atom];
+        VECTOR tempnv = {0, 0, 0};
+        for (int linear = lane; linear < ESP_ORDER5_SUPPORT;
+             linear += ESP_GPU_FINAL_LANES_PER_ATOM)
+        {
+            int kx = linear / 25;
+            int rem = linear - kx * 25;
+            int ky = rem / ESP_ORDER5;
+            int kz = rem - ky * ESP_ORDER5;
+            int near_index = sm_ix[cache_offset + kx] * PME_Nin +
+                             sm_iy[cache_offset + ky] * fftz +
+                             sm_iz[cache_offset + kz];
+            if ((unsigned int)near_index >= (unsigned int)PME_Nall) continue;
+            float wx = sm_wx[cache_offset + kx];
+            float wy = sm_wy[cache_offset + ky];
+            float wz = sm_wz[cache_offset + kz];
+            float dwx = sm_dwx[cache_offset + kx];
+            float dwy = sm_dwy[cache_offset + ky];
+            float dwz = sm_dwz[cache_offset + kz];
+            float tempdQf = -PME_Q[near_index] * temp_charge;
+            VECTOR tempdQ;
+            tempdQ.x = dwx * wy * wz * fftx;
+            tempdQ.y = dwy * wx * wz * ffty;
+            tempdQ.z = dwz * wx * wy * fftz;
+            tempdQ = tempdQf * MultiplyTranspose(tempdQ, rcell);
+            tempnv = tempnv + tempdQ;
+        }
+        for (int offset = ESP_GPU_FINAL_LANES_PER_ATOM >> 1; offset > 0;
+             offset >>= 1)
+        {
+            tempnv.x +=
+                deviceShflDown(FULL_MASK, tempnv.x, offset,
+                               ESP_GPU_FINAL_LANES_PER_ATOM);
+            tempnv.y +=
+                deviceShflDown(FULL_MASK, tempnv.y, offset,
+                               ESP_GPU_FINAL_LANES_PER_ATOM);
+            tempnv.z +=
+                deviceShflDown(FULL_MASK, tempnv.z, offset,
+                               ESP_GPU_FINAL_LANES_PER_ATOM);
+        }
+        if (lane == 0)
+        {
+            atomicAdd(force + atom, tempnv);
+        }
+    }
+#else
+    SIMPLE_DEVICE_FOR(atom, atom_numbers)
+    {
+        float wx_cache[ESP_ORDER5], wy_cache[ESP_ORDER5], wz_cache[ESP_ORDER5];
+        float dwx_cache[ESP_ORDER5], dwy_cache[ESP_ORDER5],
+            dwz_cache[ESP_ORDER5];
+        int ix_cache[ESP_ORDER5], iy_cache[ESP_ORDER5], iz_cache[ESP_ORDER5];
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
+        ESP_Fill_Window_Cache_1D(window_table, window_coeff, table_points,
+                                 poly_order, use_poly, ESP_ORDER5, temp_frxyz,
+                                 wx_cache, wy_cache, wz_cache);
+        ESP_Fill_Window_Derivative_Cache_1D(
+            window_derivative_table, window_derivative_coeff, table_points,
+            poly_order, use_poly, ESP_ORDER5, temp_frxyz, dwx_cache,
+            dwy_cache, dwz_cache);
+        ESP_Fill_Wrapped_Index_Cache_1D(temp_uxyz, ESP_ORDER5, fftx, ffty,
+                                        fftz, ix_cache, iy_cache, iz_cache);
+        float temp_charge = charge[atom];
+        VECTOR tempnv = {0, 0, 0};
+        for (int kx = 0; kx < ESP_ORDER5; kx++)
+        {
+            int base_x = ix_cache[kx] * PME_Nin;
+            float wx = wx_cache[kx];
+            float dwx = dwx_cache[kx];
+            for (int ky = 0; ky < ESP_ORDER5; ky++)
+            {
+                int base_xy = base_x + iy_cache[ky] * fftz;
+                float wy = wy_cache[ky];
+                float dwy = dwy_cache[ky];
+                for (int kz = 0; kz < ESP_ORDER5; kz++)
+                {
+                    int near_index = base_xy + iz_cache[kz];
+                    if ((unsigned int)near_index >= (unsigned int)PME_Nall)
+                    {
+                        continue;
+                    }
+                    float tempdQf = -PME_Q[near_index] * temp_charge;
+                    VECTOR tempdQ;
+                    tempdQ.x = dwx * wy * wz_cache[kz] * fftx;
+                    tempdQ.y = dwy * wx * wz_cache[kz] * ffty;
+                    tempdQ.z = dwz_cache[kz] * wx * wy * fftz;
+                    tempdQ = tempdQf * MultiplyTranspose(tempdQ, rcell);
+                    tempnv = tempnv + tempdQ;
+                }
+            }
+        }
+        atomicAdd(force + atom, tempnv);
+    }
+#endif
+}
+
+// ESP/PSWF gather：使用 dW/dx, dW/dy, dW/dz 得到 reciprocal force。
+static __global__ void ESP_Final(
+    const UNSIGNED_INT_VECTOR* PME_uxyz, const float* charge, const float* PME_Q,
+    VECTOR* force, const VECTOR* PME_frxyz, const LTMatrix3 rcell,
+    const int fftx, const int ffty, const int fftz, const int atom_numbers,
+    const int PME_Nin, const int PME_Nall, const int order, const int support,
+    const int table_points, const int poly_order, const int use_poly,
+    const float* window_table, const float* window_derivative_table,
+    const float* window_coeff, const float* window_derivative_coeff)
+{
+#ifdef GPU_ARCH_NAME
     int atom = blockDim.y * blockIdx.x + threadIdx.y;
-    if (atom < atom_numbers)
+    bool atom_valid = atom < atom_numbers;
+    extern __shared__ float sm_window_cache[];
+    float* sm_wx = sm_window_cache;
+    float* sm_wy = sm_wx + blockDim.y * order;
+    float* sm_wz = sm_wy + blockDim.y * order;
+    float* sm_dwx = sm_wz + blockDim.y * order;
+    float* sm_dwy = sm_dwx + blockDim.y * order;
+    float* sm_dwz = sm_dwy + blockDim.y * order;
+    if (atom_valid)
+    {
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        int cache_offset = threadIdx.y * order;
+        for (int i = threadIdx.x; i < order; i = i + blockDim.x)
+        {
+            sm_wx[cache_offset + i] =
+                ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.x);
+            sm_wy[cache_offset + i] =
+                ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.y);
+            sm_wz[cache_offset + i] =
+                ESP_Eval_Window(window_table, window_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.z);
+            sm_dwx[cache_offset + i] =
+                ESP_Eval_Window(window_derivative_table,
+                                window_derivative_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.x);
+            sm_dwy[cache_offset + i] =
+                ESP_Eval_Window(window_derivative_table,
+                                window_derivative_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.y);
+            sm_dwz[cache_offset + i] =
+                ESP_Eval_Window(window_derivative_table,
+                                window_derivative_coeff, table_points,
+                                poly_order, use_poly, i, temp_frxyz.z);
+        }
+    }
+    __syncthreads();
+    if (atom_valid)
 #else
 #pragma omp parallel for
     for (int atom = 0; atom < atom_numbers; atom++)
 #endif
     {
-        int* temp_near = ESP_atom_near + atom * support;
+#ifndef GPU_ARCH_NAME
         VECTOR temp_frxyz = PME_frxyz[atom];
+#else
+        VECTOR temp_frxyz = PME_frxyz[atom];
+        int cache_offset = threadIdx.y * order;
+#endif
+        UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
         float temp_charge = charge[atom];
         VECTOR tempnv = {0, 0, 0};
+#ifndef GPU_ARCH_NAME
+        if (order == ESP_ORDER5)
+        {
+            float wx_cache[ESP_ORDER5], wy_cache[ESP_ORDER5], wz_cache[ESP_ORDER5];
+            float dwx_cache[ESP_ORDER5], dwy_cache[ESP_ORDER5],
+                dwz_cache[ESP_ORDER5];
+            int ix_cache[ESP_ORDER5], iy_cache[ESP_ORDER5], iz_cache[ESP_ORDER5];
+            ESP_Fill_Window_Cache_1D(window_table, window_coeff, table_points,
+                                     poly_order, use_poly, ESP_ORDER5,
+                                     temp_frxyz, wx_cache, wy_cache, wz_cache);
+            ESP_Fill_Window_Derivative_Cache_1D(
+                window_derivative_table, window_derivative_coeff, table_points,
+                poly_order, use_poly, ESP_ORDER5, temp_frxyz, dwx_cache,
+                dwy_cache, dwz_cache);
+            ESP_Fill_Wrapped_Index_Cache_1D(temp_uxyz, ESP_ORDER5, fftx, ffty,
+                                            fftz, ix_cache, iy_cache, iz_cache);
+            for (int kx = 0; kx < ESP_ORDER5; kx++)
+            {
+                int base_x = ix_cache[kx] * PME_Nin;
+                float wx = wx_cache[kx];
+                float dwx = dwx_cache[kx];
+                for (int ky = 0; ky < ESP_ORDER5; ky++)
+                {
+                    int base_xy = base_x + iy_cache[ky] * fftz;
+                    float wy = wy_cache[ky];
+                    float dwy = dwy_cache[ky];
+                    for (int kz = 0; kz < ESP_ORDER5; kz++)
+                    {
+                        int near_index = base_xy + iz_cache[kz];
+                        if ((unsigned int)near_index >=
+                            (unsigned int)PME_Nall)
+                        {
+                            continue;
+                        }
+                        float tempdQf = -PME_Q[near_index] * temp_charge;
+                        VECTOR tempdQ;
+                        tempdQ.x = dwx * wy * wz_cache[kz] * fftx;
+                        tempdQ.y = dwy * wx * wz_cache[kz] * ffty;
+                        tempdQ.z = dwz_cache[kz] * wx * wy * fftz;
+                        tempdQ = tempdQf * MultiplyTranspose(tempdQ, rcell);
+                        tempnv = tempnv + tempdQ;
+                    }
+                }
+            }
+            Warp_Sum_To(force + atom, tempnv, 8);
+            continue;
+        }
+        std::vector<float> wx_cache(order), wy_cache(order), wz_cache(order);
+        std::vector<float> dwx_cache(order), dwy_cache(order), dwz_cache(order);
+        ESP_Fill_Window_Cache_1D(window_table, window_coeff, table_points,
+                                 poly_order, use_poly, order, temp_frxyz,
+                                 wx_cache.data(), wy_cache.data(),
+                                 wz_cache.data());
+        ESP_Fill_Window_Derivative_Cache_1D(
+            window_derivative_table, window_derivative_coeff, table_points,
+            poly_order, use_poly, order, temp_frxyz, dwx_cache.data(),
+            dwy_cache.data(), dwz_cache.data());
+#endif
 #ifdef USE_GPU
         for (int k = threadIdx.x; k < support; k = k + blockDim.x)
 #else
         for (int k = 0; k < support; k++)
 #endif
         {
-            int near_index = temp_near[k];
-            if ((unsigned int)near_index >= (unsigned int)PME_Nall)
-            {
-                continue;
-            }
-
             int kx, ky, kz;
             ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
-            float wx = ESP_Eval_Window(window_table, window_coeff, table_points,
-                                       poly_order, use_poly, kx, temp_frxyz.x);
-            float wy = ESP_Eval_Window(window_table, window_coeff, table_points,
-                                       poly_order, use_poly, ky, temp_frxyz.y);
-            float wz = ESP_Eval_Window(window_table, window_coeff, table_points,
-                                       poly_order, use_poly, kz, temp_frxyz.z);
-            float dwx = ESP_Eval_Window(window_derivative_table,
-                                        window_derivative_coeff, table_points,
-                                        poly_order, use_poly, kx, temp_frxyz.x);
-            float dwy = ESP_Eval_Window(window_derivative_table,
-                                        window_derivative_coeff, table_points,
-                                        poly_order, use_poly, ky, temp_frxyz.y);
-            float dwz = ESP_Eval_Window(window_derivative_table,
-                                        window_derivative_coeff, table_points,
-                                        poly_order, use_poly, kz, temp_frxyz.z);
-
+            int near_index = ESP_Get_Grid_Index(temp_uxyz, kx, ky, kz, fftx,
+                                                ffty, fftz, PME_Nin);
+            if ((unsigned int)near_index >= (unsigned int)PME_Nall) continue;
+#ifdef GPU_ARCH_NAME
+            float wx = sm_wx[cache_offset + kx];
+            float wy = sm_wy[cache_offset + ky];
+            float wz = sm_wz[cache_offset + kz];
+            float dwx = sm_dwx[cache_offset + kx];
+            float dwy = sm_dwy[cache_offset + ky];
+            float dwz = sm_dwz[cache_offset + kz];
+#else
+            float wx = wx_cache[kx];
+            float wy = wy_cache[ky];
+            float wz = wz_cache[kz];
+            float dwx = dwx_cache[kx];
+            float dwy = dwy_cache[ky];
+            float dwz = dwz_cache[kz];
+#endif
             float tempdQf = -PME_Q[near_index] * temp_charge;
             VECTOR tempdQ;
             tempdQ.x = dwx * wy * wz * fftx;
@@ -2135,26 +2572,49 @@ static void Run_ESP_Reciprocal_Force_Backend(
         ESP_Atom_Near,
         (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
             CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, crd, pm->ESP_atom_near,
-        pm->PME_Nin, cell, rcell, pm->atom_numbers, pm->fftx, pm->ffty,
-        pm->fftz, pm->esp.order, pm->PME_uxyz, pm->PME_frxyz,
-        pm->force_backup);
+        CONTROLLER::device_max_thread, 0, NULL, crd, cell, rcell,
+        pm->atom_numbers, pm->fftx, pm->ffty, pm->fftz, pm->PME_uxyz,
+        pm->PME_frxyz, pm->force_backup);
 
-    int spread_threads_y = pm->ESP_near_grid_points;
-    if (spread_threads_y > CONTROLLER::device_max_thread)
-        spread_threads_y = CONTROLLER::device_max_thread;
-    if (spread_threads_y < 1) spread_threads_y = 1;
-    dim3 blockSize = {
-        CONTROLLER::device_max_thread / spread_threads_y,
-        (unsigned int)spread_threads_y};
-    if (blockSize.x < 1) blockSize.x = 1;
-    Launch_Device_Kernel(
-        ESP_Q_Spread, (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
-        blockSize, 0, NULL, pm->ESP_atom_near, charge, pm->PME_frxyz,
-        pm->PME_Q, pm->atom_numbers, pm->PME_Nall, pm->esp.order,
-        pm->ESP_near_grid_points, pm->esp.table_points,
-        pm->esp.spread_poly_order, use_poly, pm->ESP_window_table,
-        pm->ESP_window_coeff);
+    dim3 blockSize(1, 1, 1);
+    if (pm->esp.order == ESP_ORDER5)
+    {
+        blockSize = {ESP_GPU_SPREAD_LANES_PER_ATOM *
+                         ESP_GPU_SPREAD_ATOMS_PER_BLOCK,
+                     1};
+        size_t spread_shared_memory =
+            ESP_GPU_SPREAD_ATOMS_PER_BLOCK * ESP_ORDER5 *
+            (3 * sizeof(float) + 3 * sizeof(int));
+        Launch_Device_Kernel(
+            ESP_Q_Spread_Order5,
+            (pm->atom_numbers + ESP_GPU_SPREAD_ATOMS_PER_BLOCK - 1) /
+                ESP_GPU_SPREAD_ATOMS_PER_BLOCK,
+            blockSize, spread_shared_memory, NULL, pm->PME_uxyz, charge,
+            pm->PME_frxyz, pm->PME_Q, pm->atom_numbers, pm->PME_Nin,
+            pm->PME_Nall, pm->fftx, pm->ffty, pm->fftz,
+            pm->esp.table_points, pm->esp.spread_poly_order, use_poly,
+            pm->ESP_window_table, pm->ESP_window_coeff);
+    }
+    else
+    {
+        int spread_threads_y = pm->ESP_near_grid_points;
+        if (spread_threads_y > CONTROLLER::device_max_thread)
+            spread_threads_y = CONTROLLER::device_max_thread;
+        if (spread_threads_y < 1) spread_threads_y = 1;
+        blockSize = {CONTROLLER::device_max_thread / spread_threads_y,
+                     (unsigned int)spread_threads_y};
+        if (blockSize.x < 1) blockSize.x = 1;
+        size_t spread_shared_memory =
+            sizeof(float) * blockSize.x * pm->esp.order * 3;
+        Launch_Device_Kernel(
+            ESP_Q_Spread, (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
+            blockSize, spread_shared_memory, NULL, pm->PME_uxyz, charge,
+            pm->PME_frxyz, pm->PME_Q, pm->atom_numbers, pm->PME_Nin,
+            pm->PME_Nall, pm->fftx, pm->ffty, pm->fftz, pm->esp.order,
+            pm->ESP_near_grid_points, pm->esp.table_points,
+            pm->esp.spread_poly_order, use_poly, pm->ESP_window_table,
+            pm->ESP_window_coeff);
+    }
     Launch_Device_Kernel(
         ESP_Sanitize_Float_List,
         (pm->PME_Nall + CONTROLLER::device_max_thread - 1) /
@@ -2199,15 +2659,41 @@ static void Run_ESP_Reciprocal_Force_Backend(
             CONTROLLER::device_max_thread,
         CONTROLLER::device_max_thread, 0, NULL, pm->PME_FBCFQ, pm->PME_Nall);
 
-    blockSize = {8, CONTROLLER::device_max_thread / 8};
-    Launch_Device_Kernel(
-        ESP_Final, (pm->atom_numbers + blockSize.y - 1) / blockSize.y,
-        blockSize, 0, NULL, pm->ESP_atom_near, charge, pm->PME_FBCFQ,
-        pm->force_backup, pm->PME_frxyz, rcell, pm->fftx, pm->ffty, pm->fftz,
-        pm->atom_numbers, pm->PME_Nall, pm->esp.order, pm->ESP_near_grid_points,
-        pm->esp.table_points, pm->esp.spread_poly_order, use_poly,
-        pm->ESP_window_table, pm->ESP_window_derivative_table,
-        pm->ESP_window_coeff, pm->ESP_window_derivative_coeff);
+    if (pm->esp.order == ESP_ORDER5)
+    {
+        blockSize = {ESP_GPU_FINAL_LANES_PER_ATOM *
+                         ESP_GPU_FINAL_ATOMS_PER_BLOCK,
+                     1};
+        size_t final_shared_memory =
+            ESP_GPU_FINAL_ATOMS_PER_BLOCK * ESP_ORDER5 *
+            (6 * sizeof(float) + 3 * sizeof(int));
+        Launch_Device_Kernel(
+            ESP_Final_Order5,
+            (pm->atom_numbers + ESP_GPU_FINAL_ATOMS_PER_BLOCK - 1) /
+                ESP_GPU_FINAL_ATOMS_PER_BLOCK,
+            blockSize, final_shared_memory, NULL, pm->PME_uxyz, charge,
+            pm->PME_FBCFQ, pm->force_backup, pm->PME_frxyz, rcell, pm->fftx,
+            pm->ffty, pm->fftz, pm->atom_numbers, pm->PME_Nin, pm->PME_Nall,
+            pm->esp.table_points, pm->esp.spread_poly_order, use_poly,
+            pm->ESP_window_table, pm->ESP_window_derivative_table,
+            pm->ESP_window_coeff, pm->ESP_window_derivative_coeff);
+    }
+    else
+    {
+        blockSize = {8, CONTROLLER::device_max_thread / 8};
+        size_t final_shared_memory =
+            sizeof(float) * blockSize.y * pm->esp.order * 6;
+        Launch_Device_Kernel(
+            ESP_Final, (pm->atom_numbers + blockSize.y - 1) / blockSize.y,
+            blockSize, final_shared_memory, NULL, pm->PME_uxyz, charge,
+            pm->PME_FBCFQ,
+            pm->force_backup, pm->PME_frxyz, rcell, pm->fftx, pm->ffty,
+            pm->fftz, pm->atom_numbers, pm->PME_Nin, pm->PME_Nall,
+            pm->esp.order, pm->ESP_near_grid_points, pm->esp.table_points,
+            pm->esp.spread_poly_order, use_poly, pm->ESP_window_table,
+            pm->ESP_window_derivative_table, pm->ESP_window_coeff,
+            pm->ESP_window_derivative_coeff);
+    }
     Launch_Device_Kernel(
         ESP_Sanitize_Vector_List,
         (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /

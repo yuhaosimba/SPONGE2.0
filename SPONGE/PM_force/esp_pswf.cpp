@@ -751,9 +751,9 @@ double Compute_Lambda(const Pswf0Reference& pswf, double c)
 
 int Default_Order_For_Tolerance(float tolerance)
 {
-    if (tolerance <= 1.0e-5f) return 8;
-    if (tolerance <= 1.0e-4f) return 6;
-    return 5;
+    if (tolerance <= 1.0e-5f) return 6;
+    if (tolerance <= 1.0e-4f) return 5;
+    return 4;
 }
 
 float Linear_Table_Eval(const std::vector<float>& table, int offset, int count,
