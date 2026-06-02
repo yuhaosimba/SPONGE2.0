@@ -62,15 +62,14 @@ struct VECTOR_LJ
     friend __device__ __host__ __forceinline__ float Get_Direct_Coulomb_Energy(
         VECTOR_LJ r1, VECTOR_LJ r2, float dr_abs, const float pme_beta)
     {
-        return r1.charge * r2.charge * erfcf(pme_beta * dr_abs) / dr_abs;
+        return PME_Get_Direct_Coulomb_Energy(r1.charge * r2.charge, dr_abs,
+                                             pme_beta);
     }
     friend __device__ __host__ __forceinline__ float Get_Direct_Coulomb_Force(
         VECTOR_LJ r1, VECTOR_LJ r2, float dr_abs, const float pme_beta)
     {
-        float beta_dr = pme_beta * dr_abs;
-        return r1.charge * r2.charge * powf(dr_abs, -3.0f) *
-               (beta_dr * TWO_DIVIDED_BY_SQRT_PI * expf(-beta_dr * beta_dr) +
-                erfcf(beta_dr));
+        return PME_Get_Direct_Coulomb_Force(r1.charge * r2.charge, dr_abs,
+                                            pme_beta);
     }
 };
 __global__ void Copy_LJ_Type_To_New_Crd(const int atom_numbers,
@@ -136,31 +135,31 @@ struct LENNARD_JONES_INFORMATION
                    int ghost_numbers);  // 获取局域粒子信息
 
     // 可以根据外界传入的need_atom_energy和need_virial，选择性计算能量和维里。其中的维里对PME直接部分计算的原子能量，在和PME其他部分加和后即维里。
-    void LJ_PME_Direct_Force_With_Atom_Energy_And_Virial(
+    void LJ_PM_Direct_Force_With_Atom_Energy_And_Virial(
         const int atom_numbers, const int local_atom_numbers,
         const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
         const float* charge, VECTOR* frc, const LTMatrix3 cell,
         const LTMatrix3 rcell, const ATOM_GROUP* nl, const float pme_beta,
-        const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
+        const PM_Direct_Parameters pm_direct, const int need_atom_energy,
         float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
         float* atom_direct_pme_energy);
 
 #ifdef KPCCL_TASKLOOP
-    void LJ_PME_Direct_Force_With_Atom_Energy_And_Virial_Init(
+    void LJ_PM_Direct_Force_With_Atom_Energy_And_Virial_Init(
         const int atom_numbers, const int local_atom_numbers,
         const int ghost_numbers, const VECTOR* crd, const float* charge,
         VECTOR* frc, const LTMatrix3 cell, const LTMatrix3 rcell,
         const ATOM_GROUP* nl, const float pme_beta,
-        const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
+        const PM_Direct_Parameters pm_direct, const int need_atom_energy,
         float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
         float* atom_direct_pme_energy);
 
-    void LJ_PME_Direct_Force_With_Atom_Energy_And_Virial_KPCCL(
+    void LJ_PM_Direct_Force_With_Atom_Energy_And_Virial_KPCCL(
         const int atom_numbers, const int local_atom_numbers,
         const int ghost_numbers, const VECTOR* crd, const float* charge,
         VECTOR* frc, const LTMatrix3 cell, const LTMatrix3 rcell,
         const ATOM_GROUP* nl, const float pme_beta,
-        const ESP_Direct_Parameters esp_direct, const int need_atom_energy,
+        const PM_Direct_Parameters pm_direct, const int need_atom_energy,
         float* atom_energy, const int need_virial, LTMatrix3* atom_virial,
         float* atom_direct_pme_energy);
 #endif

@@ -53,8 +53,8 @@ void Check_Close(float lhs, float rhs, float tolerance,
 
 void Check_Direct_Mode(const ESP_PSWF_Table& table, bool use_poly)
 {
-    ESP_Direct_Parameters direct;
-    direct.enabled = 1;
+    PM_Direct_Parameters direct;
+    direct.backend = ParticleMeshBackend::ESP;
     direct.table_points = table.table_points;
     direct.split_poly_order = table.split_poly_order;
     direct.use_polynomial_tables = use_poly ? 1 : 0;

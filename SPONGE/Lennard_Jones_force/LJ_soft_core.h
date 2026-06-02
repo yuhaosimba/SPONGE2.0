@@ -54,25 +54,22 @@ struct VECTOR_LJ_SOFT_TYPE
         VECTOR_LJ_SOFT_TYPE r1, VECTOR_LJ_SOFT_TYPE r2, float dr_abs,
         const float pme_beta)
     {
-        return r1.charge * r2.charge * erfcf(pme_beta * dr_abs) / dr_abs;
+        return PME_Get_Direct_Coulomb_Energy(r1.charge * r2.charge, dr_abs,
+                                             pme_beta);
     }
     friend __device__ __host__ __forceinline__ float Get_Direct_Coulomb_Force(
         VECTOR_LJ_SOFT_TYPE r1, VECTOR_LJ_SOFT_TYPE r2, float dr_abs,
         const float pme_beta)
     {
-        float beta_dr = pme_beta * dr_abs;
-        return r1.charge * r2.charge * powf(dr_abs, -3.0f) *
-               (beta_dr * TWO_DIVIDED_BY_SQRT_PI * expf(-beta_dr * beta_dr) +
-                erfcf(beta_dr));
+        return PME_Get_Direct_Coulomb_Force(r1.charge * r2.charge, dr_abs,
+                                            pme_beta);
     }
     friend __device__ __host__ __forceinline__ float Get_Direct_Coulomb_Virial(
         VECTOR_LJ_SOFT_TYPE r1, VECTOR_LJ_SOFT_TYPE r2, float dr_abs,
         const float pme_beta)
     {
-        float beta_dr = pme_beta * dr_abs;
-        return r1.charge * r2.charge / dr_abs *
-               (beta_dr * TWO_DIVIDED_BY_SQRT_PI * expf(-beta_dr * beta_dr) +
-                erfcf(beta_dr));
+        return PME_Get_Direct_Coulomb_Virial(r1.charge * r2.charge, dr_abs,
+                                             pme_beta);
     }
     friend __device__ __host__ __forceinline__ float
     Get_Direct_Coulomb_dU_dlambda(VECTOR_LJ_SOFT_TYPE r1,
@@ -243,7 +240,7 @@ struct LJ_SOFT_CORE
 
     void Parameter_Host_To_Device();
 
-    void LJ_Soft_Core_PME_Direct_Force_With_Atom_Energy_And_Virial(
+    void LJ_Soft_Core_PM_Direct_Force_With_Atom_Energy_And_Virial(
         const int atom_numbers, const int local_atom_numbers,
         const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
         const float* charge, VECTOR* frc, const LTMatrix3 cell,

@@ -24,6 +24,8 @@ set(SPONGE_RUNTIME_SOURCES
     ${PROJECT_ROOT_DIR}/SPONGE/barostat/pressure_based_barostat.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/barostat/MC_barostat.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/PM_force/PM_force.cpp
+    ${PROJECT_ROOT_DIR}/SPONGE/PM_force/PM_force_pme.cpp
+    ${PROJECT_ROOT_DIR}/SPONGE/PM_force/PM_force_esp.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/PM_force/esp_pswf.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/angle/angle.cpp
     ${PROJECT_ROOT_DIR}/SPONGE/angle/Urey_Bradley_force.cpp

@@ -54,20 +54,21 @@ struct ESP_Parameters
     bool print_detail = false;
 };
 
-struct ESP_Direct_Parameters
+struct PM_Direct_Parameters
 {
-    int enabled = 0;
+    ParticleMeshBackend backend = ParticleMeshBackend::PME;
     int table_points = 0;
     int split_poly_order = 0;
     int use_polynomial_tables = 1;
     float cutoff = 0.0f;
+    float pme_beta = 0.0f;
     const float* split_real_table = NULL;
     const float* split_real_derivative_table = NULL;
     const float* split_real_coeff = NULL;
     const float* split_real_derivative_coeff = NULL;
 };
 
-#include "esp_direct.h"
+#include "pm_direct.h"
 
 struct Particle_Mesh
 {
@@ -262,7 +263,10 @@ struct Particle_Mesh
         LTMatrix3* d_virial, float* d_potential, int step);
 
     void Update_Box(LTMatrix3 cell, LTMatrix3 rcell, LTMatrix3 g, float dt);
-    ESP_Direct_Parameters Get_ESP_Direct_Parameters() const;
+    PM_Direct_Parameters Get_PM_Direct_Parameters() const;
+    void Validate_Direct_Force_Path(bool uses_selective_direct,
+                                    bool uses_soft_core_direct) const;
+    void Sanitize_Force(VECTOR* force, int atom_numbers) const;
     void Step_Print(CONTROLLER* controller);
 
     void Get_Local(CONTROLLER* controller, int step, VECTOR box_length,

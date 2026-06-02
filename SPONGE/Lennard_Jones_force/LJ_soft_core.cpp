@@ -718,7 +718,7 @@ void LJ_SOFT_CORE::Parameter_Host_To_Device()
                          sizeof(VECTOR_LJ_SOFT_TYPE) * atom_numbers);
 }
 
-void LJ_SOFT_CORE::LJ_Soft_Core_PME_Direct_Force_With_Atom_Energy_And_Virial(
+void LJ_SOFT_CORE::LJ_Soft_Core_PM_Direct_Force_With_Atom_Energy_And_Virial(
     const int atom_numbers, const int local_atom_numbers,
     const int solvent_numbers, const int ghost_numbers, const VECTOR* crd,
     const float* charge, VECTOR* frc, const LTMatrix3 cell,
