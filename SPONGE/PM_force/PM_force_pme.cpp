@@ -4,24 +4,29 @@ __global__ void charge_square_kernel(int element_number, const float* charge,
                                      float* charge_square);
 __global__ void PME_Add_Energy_To_Potential(float* d_ene, float* d_self_ene,
                                             float* d_reciprocal_ene);
-__global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
-                              const int PME_Nin, const LTMatrix3 cell,
+__global__ void PME_Atom_Near(const VECTOR* crd, const int PME_Nin,
+                              const LTMatrix3 cell,
                               const LTMatrix3 rcell, const int atom_numbers,
                               const int fftx, const int ffty, const int fftz,
                               UNSIGNED_INT_VECTOR* PME_uxyz, VECTOR* PME_frxyz,
                               VECTOR* force_backup);
-__global__ void PME_Q_Spread(int* PME_atom_near, const float* charge,
-                             const VECTOR* PME_frxyz, float* PME_Q,
-                             const int atom_numbers, const int PME_Nall);
+__global__ void PME_Q_Spread(const UNSIGNED_INT_VECTOR* PME_uxyz,
+                             const float* charge, const VECTOR* PME_frxyz,
+                             float* PME_Q, const int atom_numbers,
+                             const int PME_Nin, const int fftx,
+                             const int ffty, const int fftz,
+                             const int PME_Nall);
 __global__ void PME_BCFQ(FFT_COMPLEX* PME_FQ, float* PME_BC, int PME_Nfft);
 __global__ void PME_Energy_Product(const int element_number, const float* list1,
                                    const float* list2, float* sum);
 __global__ void device_add(float* ene, float factor, float* charge_sum);
-__global__ void PME_Final(int* PME_atom_near, const float* charge,
+__global__ void PME_Final(const UNSIGNED_INT_VECTOR* PME_uxyz,
+                          const float* charge,
                           const float* PME_Q, VECTOR* force,
                           const VECTOR* PME_frxyz, const LTMatrix3 rcell,
                           const int fftx, const int ffty, const int fftz,
-                          const int atom_numbers, const int PME_Nall);
+                          const int atom_numbers, const int PME_Nall,
+                          const int PME_Nin);
 __global__ void PME_Sum_Virial(const int nfft, const LTMatrix3* virial_BC,
                                const FFT_COMPLEX* FQ, LTMatrix3* virial,
                                int fftz);
@@ -46,15 +51,16 @@ void Run_PME_Reciprocal_Force_Backend(
         PME_Atom_Near,
         (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
             CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, crd, pm->PME_atom_near,
-        pm->PME_Nin, cell, rcell, pm->atom_numbers, pm->fftx, pm->ffty,
+        CONTROLLER::device_max_thread, 0, NULL, crd, pm->PME_Nin, cell, rcell,
+        pm->atom_numbers, pm->fftx, pm->ffty,
         pm->fftz, pm->PME_uxyz, pm->PME_frxyz, pm->force_backup);
 
     dim3 blockSize = {CONTROLLER::device_max_thread / 64, 64};
     Launch_Device_Kernel(PME_Q_Spread,
                          (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
-                         blockSize, 0, NULL, pm->PME_atom_near, charge,
+                         blockSize, 0, NULL, pm->PME_uxyz, charge,
                          pm->PME_frxyz, pm->PME_Q, pm->atom_numbers,
+                         pm->PME_Nin, pm->fftx, pm->ffty, pm->fftz,
                          pm->PME_Nall);
 
     SPONGE_FFT_WRAPPER::R2C(pm->PME_plan_r2c, pm->PME_Q, pm->PME_FQ);
@@ -83,10 +89,10 @@ void Run_PME_Reciprocal_Force_Backend(
     blockSize = {8, CONTROLLER::device_max_thread / 8};
     Launch_Device_Kernel(PME_Final,
                          (pm->atom_numbers + blockSize.x - 1) / blockSize.x,
-                         blockSize, 0, NULL, pm->PME_atom_near, charge,
+                         blockSize, 0, NULL, pm->PME_uxyz, charge,
                          pm->PME_FBCFQ, pm->force_backup, pm->PME_frxyz, rcell,
                          pm->fftx, pm->ffty, pm->fftz, pm->atom_numbers,
-                         pm->PME_Nall);
+                         pm->PME_Nall, pm->PME_Nin);
 
     Launch_Device_Kernel(
         device_add_force,

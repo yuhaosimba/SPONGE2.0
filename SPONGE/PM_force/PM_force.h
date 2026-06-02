@@ -150,9 +150,6 @@ struct Particle_Mesh
     float* PME_Q = NULL;         // 网格上的电荷密度
     float* PME_FBCFQ = NULL;     // 网格上的电荷密度乘以BC
     FFT_COMPLEX* PME_FQ = NULL;  // 网格上的电荷密度的傅里叶变换
-    int* PME_atom_near =
-        NULL;  // 四阶Bspline插值，每个原子附近的网格点 size = atom_numbers*64
-
     int* PME_atom_near_global = NULL;  // 用于检验电荷插值错误
 
     // ESP/PSWF backend buffers.  These are initialized only when
@@ -298,16 +295,19 @@ struct Particle_Mesh
     void Distribute_Ghost_Information(CONTROLLER* controller, VECTOR* frc);
 };
 
-__global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
-                              const int PME_Nin, const LTMatrix3 cell,
+__global__ void PME_Atom_Near(const VECTOR* crd, const int PME_Nin,
+                              const LTMatrix3 cell,
                               const LTMatrix3 rcell, const int atom_numbers,
                               const int fftx, const int ffty, const int fftz,
                               UNSIGNED_INT_VECTOR* PME_uxyz, VECTOR* PME_frxyz,
                               VECTOR* force_backup);
 
-__global__ void PME_Q_Spread(int* PME_atom_near, const float* charge,
-                             const VECTOR* PME_frxyz, float* PME_Q,
-                             const int atom_numbers);
+__global__ void PME_Q_Spread(const UNSIGNED_INT_VECTOR* PME_uxyz,
+                             const float* charge, const VECTOR* PME_frxyz,
+                             float* PME_Q, const int atom_numbers,
+                             const int PME_Nin, const int fftx,
+                             const int ffty, const int fftz,
+                             const int PME_Nall);
 
 __global__ void PME_BCFQ(FFT_COMPLEX* PME_FQ, float* PME_BC, int PME_Nfft);
 

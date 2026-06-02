@@ -980,10 +980,6 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
     Device_Malloc_Safely((void**)&PME_FQ, sizeof(FFT_COMPLEX) * PME_Nfft);
     Device_Malloc_Safely((void**)&PME_FBCFQ, sizeof(float) * PME_Nall);
 
-    Device_Malloc_Safely((void**)&PME_atom_near,
-                         sizeof(int) * 64 * atom_numbers);
-    deviceMemset(PME_atom_near, 0, sizeof(int) * 64 * atom_numbers);
-
     FFT_SIZE_t n3d[3] = {fftx, ffty, fftz};
     errP1 =
         SPONGE_FFT_WRAPPER::Make_FFT_Plan(&PME_plan_r2c, 1, 3, n3d, FFT_R2C);
@@ -1362,7 +1358,6 @@ void Particle_Mesh::Clear()
         Free_Single_Device_Pointer((void**)&g_crd);
         Free_Single_Device_Pointer((void**)&g_frc);
 
-        Free_Single_Device_Pointer((void**)&PME_atom_near);
         Free_Single_Device_Pointer((void**)&force_backup);
 
         SPONGE_FFT_WRAPPER::Destroy_FFT_Plan(&PME_plan_r2c);
@@ -1378,9 +1373,9 @@ void Particle_Mesh::Clear()
     }
 }
 
-// 计算每个原子所在的网格点以及其周围64个网格点的索引
-__global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
-                              const int PME_Nin, const LTMatrix3 cell,
+// 计算每个原子所在的网格点以及对应的分数坐标
+__global__ void PME_Atom_Near(const VECTOR* crd, const int PME_Nin,
+                              const LTMatrix3 cell,
                               const LTMatrix3 rcell, const int atom_numbers,
                               const int fftx, const int ffty, const int fftz,
                               UNSIGNED_INT_VECTOR* PME_uxyz, VECTOR* PME_frxyz,
@@ -1398,7 +1393,7 @@ __global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
         {
             frac_crd = {0.0f, 0.0f, 0.0f};
         }
-        int k, tempux, tempuy, tempuz;
+        int tempux, tempuy, tempuz;
         frac_crd.x *= fftx;
         tempux = (int)frac_crd.x;
         tempux = tempux < 0 ? 0 : (tempux < fftx ? tempux : fftx - 1);
@@ -1414,33 +1409,52 @@ __global__ void PME_Atom_Near(const VECTOR* crd, int* PME_atom_near,
         tempuz = tempuz < 0 ? 0 : (tempuz < fftz ? tempuz : fftz - 1);
         PME_frxyz[atom].z = frac_crd.z - tempuz;
         PME_frxyz[atom].z = PME_frxyz[atom].z - floorf(PME_frxyz[atom].z);
-        if (tempux != (*temp_uxyz).uint_x || tempuy != (*temp_uxyz).uint_y ||
-            tempuz != (*temp_uxyz).uint_z)
+        (*temp_uxyz).uint_x = tempux;
+        (*temp_uxyz).uint_y = tempuy;
+        (*temp_uxyz).uint_z = tempuz;
+    }
+}
+
+static __device__ __host__ __forceinline__ int PME_Wrap_Subtract_Index(
+    int base, int delta, int n)
+{
+    int value = base - delta;
+    if (value < 0) value += n;
+    if (value >= n) value -= n;
+    return value;
+}
+
+static __device__ __host__ __forceinline__ void PME_Fill_Spline4(
+    float frac, float values[4], float* derivatives)
+{
+    static constexpr float kPME_Ma[4] = {1.0f / 6.0f, -0.5f, 0.5f, -1.0f / 6.0f};
+    static constexpr float kPME_Mb[4] = {0.0f, 0.5f, -1.0f, 0.5f};
+    static constexpr float kPME_Mc[4] = {0.0f, 0.5f, 0.0f, -0.5f};
+    static constexpr float kPME_Md[4] = {0.0f, 1.0f / 6.0f, 4.0f / 6.0f,
+                                         1.0f / 6.0f};
+    static constexpr float kPME_dMa[4] = {0.5f, -1.5f, 1.5f, -0.5f};
+    static constexpr float kPME_dMb[4] = {0.0f, 1.0f, -2.0f, 1.0f};
+    static constexpr float kPME_dMc[4] = {0.0f, 0.5f, 0.0f, -0.5f};
+    float frac2 = frac * frac;
+    float frac3 = frac * frac2;
+    for (int i = 0; i < 4; i++)
+    {
+        values[i] = kPME_Ma[i] * frac3 + kPME_Mb[i] * frac2 +
+                    kPME_Mc[i] * frac + kPME_Md[i];
+        if (derivatives != NULL)
         {
-            (*temp_uxyz).uint_x = tempux;
-            (*temp_uxyz).uint_y = tempuy;
-            (*temp_uxyz).uint_z = tempuz;
-            int* temp_near = PME_atom_near + atom * 64;
-            int kx, ky, kz;
-            for (k = 0; k < 64; k++)
-            {
-                kx = k / 16;
-                ky = (k - 16 * kx) / 4;
-                kz = k % 4;
-
-                kx = tempux - kx;
-
-                if (kx < 0) kx += fftx;
-                if (kx >= fftx) kx -= fftx;
-                ky = tempuy - ky;
-                if (ky < 0) ky += ffty;
-                if (ky >= ffty) ky -= ffty;
-                kz = tempuz - kz;
-                if (kz < 0) kz += fftz;
-                if (kz >= fftz) kz -= fftz;
-                temp_near[k] = kx * PME_Nin + ky * fftz + kz;
-            }
+            derivatives[i] =
+                kPME_dMa[i] * frac2 + kPME_dMb[i] * frac + kPME_dMc[i];
         }
+    }
+}
+
+static __device__ __host__ __forceinline__ void PME_Fill_Wrap_Index4(
+    int base, int n, int indices[4])
+{
+    for (int i = 0; i < 4; i++)
+    {
+        indices[i] = PME_Wrap_Subtract_Index(base, i, n);
     }
 }
 
@@ -1466,54 +1480,80 @@ __global__ void ESP_Sanitize_Complex_List(FFT_COMPLEX* values,
 __global__ void ESP_Sanitize_Vector_List(VECTOR* values, const int count);
 
 // 将原子电荷分配到其周围的64个网格点上
-__global__ void PME_Q_Spread(int* PME_atom_near, const float* charge,
-                             const VECTOR* PME_frxyz, float* PME_Q,
-                             const int atom_numbers, const int PME_Nall)
+__global__ void PME_Q_Spread(const UNSIGNED_INT_VECTOR* PME_uxyz,
+                             const float* charge, const VECTOR* PME_frxyz,
+                             float* PME_Q, const int atom_numbers,
+                             const int PME_Nin, const int fftx,
+                             const int ffty, const int fftz,
+                             const int PME_Nall)
 {
+#ifdef USE_GPU
+    __shared__ float s_wx[16][4];
+    __shared__ float s_wy[16][4];
+    __shared__ float s_wz[16][4];
+    __shared__ int s_ix[16][4];
+    __shared__ int s_iy[16][4];
+    __shared__ int s_iz[16][4];
+#endif
     SIMPLE_DEVICE_FOR(atom, atom_numbers)
     {
-        int k;
-        float tempf, tempQ, tempf2;
-        int* temp_near = PME_atom_near + atom * 64;
         VECTOR temp_frxyz = PME_frxyz[atom];
         float tempcharge = charge[atom];
-
-        unsigned int kx;
+        const UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
 #ifdef USE_GPU
-        for (k = threadIdx.y; k < 64; k = k + blockDim.y)
+        if (threadIdx.y < 4)
+        {
+            float wx[4], wy[4], wz[4];
+            PME_Fill_Spline4(temp_frxyz.x, wx, NULL);
+            PME_Fill_Spline4(temp_frxyz.y, wy, NULL);
+            PME_Fill_Spline4(temp_frxyz.z, wz, NULL);
+            s_wx[threadIdx.x][threadIdx.y] = wx[threadIdx.y];
+            s_wy[threadIdx.x][threadIdx.y] = wy[threadIdx.y];
+            s_wz[threadIdx.x][threadIdx.y] = wz[threadIdx.y];
+            s_ix[threadIdx.x][threadIdx.y] =
+                PME_Wrap_Subtract_Index(temp_uxyz.uint_x, threadIdx.y, fftx);
+            s_iy[threadIdx.x][threadIdx.y] =
+                PME_Wrap_Subtract_Index(temp_uxyz.uint_y, threadIdx.y, ffty);
+            s_iz[threadIdx.x][threadIdx.y] =
+                PME_Wrap_Subtract_Index(temp_uxyz.uint_z, threadIdx.y, fftz);
+        }
+        __syncthreads();
+        for (int k = threadIdx.y; k < 64; k = k + blockDim.y)
 #else
-        for (k = 0; k < 64; k++)
+        float wx[4], wy[4], wz[4];
+        int ix[4], iy[4], iz[4];
+        PME_Fill_Spline4(temp_frxyz.x, wx, NULL);
+        PME_Fill_Spline4(temp_frxyz.y, wy, NULL);
+        PME_Fill_Spline4(temp_frxyz.z, wz, NULL);
+        PME_Fill_Wrap_Index4(temp_uxyz.uint_x, fftx, ix);
+        PME_Fill_Wrap_Index4(temp_uxyz.uint_y, ffty, iy);
+        PME_Fill_Wrap_Index4(temp_uxyz.uint_z, fftz, iz);
+        for (int kx = 0; kx < 4; kx++)
+            for (int ky = 0; ky < 4; ky++)
+                for (int kz = 0; kz < 4; kz++)
 #endif
         {
-            kx = k / 16;
-            tempf = temp_frxyz.x;
-            tempf2 = tempf * tempf;
-            tempf = PME_Ma[kx] * tempf * tempf2 + PME_Mb[kx] * tempf2 +
-                    PME_Mc[kx] * tempf + PME_Md[kx];
-
-            tempQ = tempcharge * tempf;
-
-            kx = (k - kx * 16) / 4;
-            tempf = temp_frxyz.y;
-            tempf2 = tempf * tempf;
-            tempf = PME_Ma[kx] * tempf * tempf2 + PME_Mb[kx] * tempf2 +
-                    PME_Mc[kx] * tempf + PME_Md[kx];
-
-            tempQ = tempQ * tempf;
-
-            kx = k % 4;
-            tempf = temp_frxyz.z;
-            tempf2 = tempf * tempf;
-            tempf = PME_Ma[kx] * tempf * tempf2 + PME_Mb[kx] * tempf2 +
-                    PME_Mc[kx] * tempf + PME_Md[kx];
-            tempQ = tempQ * tempf;
-
-            int near_index = temp_near[k];
+#ifdef USE_GPU
+            int kx = k / 16;
+            int ky = (k % 16) / 4;
+            int kz = k % 4;
+            float tempQ = tempcharge * s_wx[threadIdx.x][kx] *
+                          s_wy[threadIdx.x][ky] * s_wz[threadIdx.x][kz];
+            int near_index =
+                s_ix[threadIdx.x][kx] * PME_Nin +
+                s_iy[threadIdx.x][ky] * fftz + s_iz[threadIdx.x][kz];
+#else
+            float tempQ = tempcharge * wx[kx] * wy[ky] * wz[kz];
+            int near_index = ix[kx] * PME_Nin + iy[ky] * fftz + iz[kz];
+#endif
             if ((unsigned int)near_index < (unsigned int)PME_Nall)
             {
                 atomicAdd(&PME_Q[near_index], tempQ);
             }
         }
+#ifdef USE_GPU
+        __syncthreads();
+#endif
     }
 }
 
@@ -1530,11 +1570,13 @@ __global__ void PME_BCFQ(FFT_COMPLEX* PME_FQ, float* PME_BC, int PME_Nfft)
 }
 
 // 计算每个原子受力
-__global__ void PME_Final(int* PME_atom_near, const float* charge,
+__global__ void PME_Final(const UNSIGNED_INT_VECTOR* PME_uxyz,
+                          const float* charge,
                           const float* PME_Q, VECTOR* force,
                           const VECTOR* PME_frxyz, const LTMatrix3 rcell,
                           const int fftx, const int ffty, const int fftz,
-                          const int atom_numbers, const int PME_Nall)
+                          const int atom_numbers, const int PME_Nall,
+                          const int PME_Nin)
 {
 #ifdef GPU_ARCH_NAME
     int atom = blockDim.y * blockIdx.x + threadIdx.y;
@@ -1549,8 +1591,8 @@ __global__ void PME_Final(int* PME_atom_near, const float* charge,
         VECTOR tempdQ;
         float tempf, tempf2;
         float temp_charge = charge[atom];
-        int* temp_near = PME_atom_near + atom * 64;
         VECTOR temp_frxyz = PME_frxyz[atom];
+        const UNSIGNED_INT_VECTOR temp_uxyz = PME_uxyz[atom];
         VECTOR tempnv = {0, 0, 0};
 #ifdef USE_GPU
         for (k = threadIdx.x; k < 64; k = k + blockDim.x)
@@ -1558,33 +1600,37 @@ __global__ void PME_Final(int* PME_atom_near, const float* charge,
         for (k = 0; k < 64; k++)
 #endif
         {
-            int near_index = temp_near[k];
+            kx = k / 16;
+            int ky = (k - kx * 16) / 4;
+            int kz = k % 4;
+            int near_index = PME_Wrap_Subtract_Index(temp_uxyz.uint_x, kx, fftx) *
+                                 PME_Nin +
+                             PME_Wrap_Subtract_Index(temp_uxyz.uint_y, ky, ffty) *
+                                 fftz +
+                             PME_Wrap_Subtract_Index(temp_uxyz.uint_z, kz, fftz);
             if ((unsigned int)near_index >= (unsigned int)PME_Nall)
             {
                 continue;
             }
             tempdQf = -PME_Q[near_index] * temp_charge;
 
-            kx = k / 16;
             tempf = temp_frxyz.x;
             tempf2 = tempf * tempf;
             tempx = PME_Ma[kx] * tempf * tempf2 + PME_Mb[kx] * tempf2 +
                     PME_Mc[kx] * tempf + PME_Md[kx];
             tempdx = PME_dMa[kx] * tempf2 + PME_dMb[kx] * tempf + PME_dMc[kx];
 
-            kx = (k - kx * 16) / 4;
             tempf = temp_frxyz.y;
             tempf2 = tempf * tempf;
-            tempy = PME_Ma[kx] * tempf * tempf2 + PME_Mb[kx] * tempf2 +
-                    PME_Mc[kx] * tempf + PME_Md[kx];
-            tempdy = PME_dMa[kx] * tempf2 + PME_dMb[kx] * tempf + PME_dMc[kx];
+            tempy = PME_Ma[ky] * tempf * tempf2 + PME_Mb[ky] * tempf2 +
+                    PME_Mc[ky] * tempf + PME_Md[ky];
+            tempdy = PME_dMa[ky] * tempf2 + PME_dMb[ky] * tempf + PME_dMc[ky];
 
-            kx = k % 4;
             tempf = temp_frxyz.z;
             tempf2 = tempf * tempf;
-            tempz = PME_Ma[kx] * tempf * tempf2 + PME_Mb[kx] * tempf2 +
-                    PME_Mc[kx] * tempf + PME_Md[kx];
-            tempdz = PME_dMa[kx] * tempf2 + PME_dMb[kx] * tempf + PME_dMc[kx];
+            tempz = PME_Ma[kz] * tempf * tempf2 + PME_Mb[kz] * tempf2 +
+                    PME_Mc[kz] * tempf + PME_Md[kz];
+            tempdz = PME_dMa[kz] * tempf2 + PME_dMb[kz] * tempf + PME_dMc[kz];
 
             tempdQ.x = tempdx * tempy * tempz * fftx;
             tempdQ.y = tempdy * tempx * tempz * ffty;
