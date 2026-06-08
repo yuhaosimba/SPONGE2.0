@@ -942,7 +942,6 @@ void Particle_Mesh::Initial(CONTROLLER* controller, int atom_numbers,
     if (esp_auto_bandlimit)
     {
         esp.c_split = esp_defaults.c_split;
-        esp.c_spread = esp_defaults.c_window;
     }
 
     controller->printf("    fftx: %d\n", fftx);
@@ -1374,6 +1373,45 @@ void Particle_Mesh::Clear()
 }
 
 // 计算每个原子所在的网格点以及对应的分数坐标
+static __device__ __host__ __forceinline__ int PME_Wrap_Subtract_Index(
+    int base, int delta, int n)
+{
+    int value = base - delta;
+    if (value < 0) value += n;
+    if (value >= n) value -= n;
+    return value;
+}
+
+static __device__ __host__ __forceinline__ void PME_Normalize_Grid_Fraction(
+    float scaled_coord, int n, int* index, float* frac)
+{
+    constexpr float kBoundaryTol = 2.0e-5f;
+    int i = (int)scaled_coord;
+    float f = scaled_coord - i;
+    if (f >= 1.0f - kBoundaryTol)
+    {
+        i += 1;
+        f = 0.0f;
+    }
+    else if (f <= kBoundaryTol)
+    {
+        f = 0.0f;
+    }
+    if (i >= n) i -= n;
+    if (i < 0) i += n;
+    *index = i;
+    *frac = f;
+}
+
+static __device__ __host__ __forceinline__ int PME_Wrap_Add_Index(
+    int base, int delta, int n)
+{
+    int value = base + delta;
+    if (value >= n) value -= n;
+    if (value < 0) value += n;
+    return value;
+}
+
 __global__ void PME_Atom_Near(const VECTOR* crd, const int PME_Nin,
                               const LTMatrix3 cell,
                               const LTMatrix3 rcell, const int atom_numbers,
@@ -1395,33 +1433,18 @@ __global__ void PME_Atom_Near(const VECTOR* crd, const int PME_Nin,
         }
         int tempux, tempuy, tempuz;
         frac_crd.x *= fftx;
-        tempux = (int)frac_crd.x;
-        tempux = tempux < 0 ? 0 : (tempux < fftx ? tempux : fftx - 1);
-        PME_frxyz[atom].x = frac_crd.x - tempux;
-        PME_frxyz[atom].x = PME_frxyz[atom].x - floorf(PME_frxyz[atom].x);
+        PME_Normalize_Grid_Fraction(frac_crd.x, fftx, &tempux,
+                                    &PME_frxyz[atom].x);
         frac_crd.y *= ffty;
-        tempuy = (int)frac_crd.y;
-        tempuy = tempuy < 0 ? 0 : (tempuy < ffty ? tempuy : ffty - 1);
-        PME_frxyz[atom].y = frac_crd.y - tempuy;
-        PME_frxyz[atom].y = PME_frxyz[atom].y - floorf(PME_frxyz[atom].y);
+        PME_Normalize_Grid_Fraction(frac_crd.y, ffty, &tempuy,
+                                    &PME_frxyz[atom].y);
         frac_crd.z *= fftz;
-        tempuz = (int)frac_crd.z;
-        tempuz = tempuz < 0 ? 0 : (tempuz < fftz ? tempuz : fftz - 1);
-        PME_frxyz[atom].z = frac_crd.z - tempuz;
-        PME_frxyz[atom].z = PME_frxyz[atom].z - floorf(PME_frxyz[atom].z);
+        PME_Normalize_Grid_Fraction(frac_crd.z, fftz, &tempuz,
+                                    &PME_frxyz[atom].z);
         (*temp_uxyz).uint_x = tempux;
         (*temp_uxyz).uint_y = tempuy;
         (*temp_uxyz).uint_z = tempuz;
     }
-}
-
-static __device__ __host__ __forceinline__ int PME_Wrap_Subtract_Index(
-    int base, int delta, int n)
-{
-    int value = base - delta;
-    if (value < 0) value += n;
-    if (value >= n) value -= n;
-    return value;
 }
 
 static __device__ __host__ __forceinline__ void PME_Fill_Spline4(
@@ -1511,11 +1534,11 @@ __global__ void PME_Q_Spread(const UNSIGNED_INT_VECTOR* PME_uxyz,
             s_wy[threadIdx.x][threadIdx.y] = wy[threadIdx.y];
             s_wz[threadIdx.x][threadIdx.y] = wz[threadIdx.y];
             s_ix[threadIdx.x][threadIdx.y] =
-                PME_Wrap_Subtract_Index(temp_uxyz.uint_x, threadIdx.y, fftx);
+                PME_Wrap_Add_Index(temp_uxyz.uint_x, 3 - threadIdx.y, fftx);
             s_iy[threadIdx.x][threadIdx.y] =
-                PME_Wrap_Subtract_Index(temp_uxyz.uint_y, threadIdx.y, ffty);
+                PME_Wrap_Add_Index(temp_uxyz.uint_y, 3 - threadIdx.y, ffty);
             s_iz[threadIdx.x][threadIdx.y] =
-                PME_Wrap_Subtract_Index(temp_uxyz.uint_z, threadIdx.y, fftz);
+                PME_Wrap_Add_Index(temp_uxyz.uint_z, 3 - threadIdx.y, fftz);
         }
         __syncthreads();
         for (int k = threadIdx.y; k < 64; k = k + blockDim.y)
@@ -1525,9 +1548,12 @@ __global__ void PME_Q_Spread(const UNSIGNED_INT_VECTOR* PME_uxyz,
         PME_Fill_Spline4(temp_frxyz.x, wx, NULL);
         PME_Fill_Spline4(temp_frxyz.y, wy, NULL);
         PME_Fill_Spline4(temp_frxyz.z, wz, NULL);
-        PME_Fill_Wrap_Index4(temp_uxyz.uint_x, fftx, ix);
-        PME_Fill_Wrap_Index4(temp_uxyz.uint_y, ffty, iy);
-        PME_Fill_Wrap_Index4(temp_uxyz.uint_z, fftz, iz);
+        for (int i = 0; i < 4; i++)
+        {
+            ix[i] = PME_Wrap_Add_Index(temp_uxyz.uint_x, 3 - i, fftx);
+            iy[i] = PME_Wrap_Add_Index(temp_uxyz.uint_y, 3 - i, ffty);
+            iz[i] = PME_Wrap_Add_Index(temp_uxyz.uint_z, 3 - i, fftz);
+        }
         for (int kx = 0; kx < 4; kx++)
             for (int ky = 0; ky < 4; ky++)
                 for (int kz = 0; kz < 4; kz++)
@@ -1603,11 +1629,11 @@ __global__ void PME_Final(const UNSIGNED_INT_VECTOR* PME_uxyz,
             kx = k / 16;
             int ky = (k - kx * 16) / 4;
             int kz = k % 4;
-            int near_index = PME_Wrap_Subtract_Index(temp_uxyz.uint_x, kx, fftx) *
+            int near_index = PME_Wrap_Add_Index(temp_uxyz.uint_x, 3 - kx, fftx) *
                                  PME_Nin +
-                             PME_Wrap_Subtract_Index(temp_uxyz.uint_y, ky, ffty) *
+                             PME_Wrap_Add_Index(temp_uxyz.uint_y, 3 - ky, ffty) *
                                  fftz +
-                             PME_Wrap_Subtract_Index(temp_uxyz.uint_z, kz, fftz);
+                             PME_Wrap_Add_Index(temp_uxyz.uint_z, 3 - kz, fftz);
             if ((unsigned int)near_index >= (unsigned int)PME_Nall)
             {
                 continue;
@@ -1698,12 +1724,12 @@ static __device__ __forceinline__ int ESP_Wrap_Subtract_Index(int base, int delt
 }
 
 static __device__ __forceinline__ int ESP_Get_Grid_Index(
-    const UNSIGNED_INT_VECTOR& uxyz, int kx, int ky, int kz, int fftx, int ffty,
-    int fftz, int PME_Nin)
+    const UNSIGNED_INT_VECTOR& uxyz, int kx, int ky, int kz, int order,
+    int fftx, int ffty, int fftz, int PME_Nin)
 {
-    int ix = ESP_Wrap_Subtract_Index(uxyz.uint_x, kx, fftx);
-    int iy = ESP_Wrap_Subtract_Index(uxyz.uint_y, ky, ffty);
-    int iz = ESP_Wrap_Subtract_Index(uxyz.uint_z, kz, fftz);
+    int ix = ESP_Wrap_Subtract_Index(uxyz.uint_x + order - 1, kx, fftx);
+    int iy = ESP_Wrap_Subtract_Index(uxyz.uint_y + order - 1, ky, ffty);
+    int iz = ESP_Wrap_Subtract_Index(uxyz.uint_z + order - 1, kz, fftz);
     return ix * PME_Nin + iy * fftz + iz;
 }
 
@@ -1749,9 +1775,9 @@ static __device__ __forceinline__ void ESP_Fill_Wrapped_Index_Cache_1D(
 {
     for (int i = 0; i < order; i++)
     {
-        ix[i] = ESP_Wrap_Subtract_Index(uxyz.uint_x, i, fftx);
-        iy[i] = ESP_Wrap_Subtract_Index(uxyz.uint_y, i, ffty);
-        iz[i] = ESP_Wrap_Subtract_Index(uxyz.uint_z, i, fftz);
+        ix[i] = ESP_Wrap_Subtract_Index(uxyz.uint_x + order - 1, i, fftx);
+        iy[i] = ESP_Wrap_Subtract_Index(uxyz.uint_y + order - 1, i, ffty);
+        iz[i] = ESP_Wrap_Subtract_Index(uxyz.uint_z + order - 1, i, fftz);
     }
 }
 
@@ -1775,22 +1801,19 @@ __global__ void ESP_Atom_Near(
         }
 
         frac_crd.x *= fftx;
-        int tempux = (int)frac_crd.x;
-        tempux = tempux < 0 ? 0 : (tempux < fftx ? tempux : fftx - 1);
-        PME_frxyz[atom].x = frac_crd.x - tempux;
-        PME_frxyz[atom].x = PME_frxyz[atom].x - floorf(PME_frxyz[atom].x);
+        int tempux;
+        PME_Normalize_Grid_Fraction(frac_crd.x, fftx, &tempux,
+                                    &PME_frxyz[atom].x);
 
         frac_crd.y *= ffty;
-        int tempuy = (int)frac_crd.y;
-        tempuy = tempuy < 0 ? 0 : (tempuy < ffty ? tempuy : ffty - 1);
-        PME_frxyz[atom].y = frac_crd.y - tempuy;
-        PME_frxyz[atom].y = PME_frxyz[atom].y - floorf(PME_frxyz[atom].y);
+        int tempuy;
+        PME_Normalize_Grid_Fraction(frac_crd.y, ffty, &tempuy,
+                                    &PME_frxyz[atom].y);
 
         frac_crd.z *= fftz;
-        int tempuz = (int)frac_crd.z;
-        tempuz = tempuz < 0 ? 0 : (tempuz < fftz ? tempuz : fftz - 1);
-        PME_frxyz[atom].z = frac_crd.z - tempuz;
-        PME_frxyz[atom].z = PME_frxyz[atom].z - floorf(PME_frxyz[atom].z);
+        int tempuz;
+        PME_Normalize_Grid_Fraction(frac_crd.z, fftz, &tempuz,
+                                    &PME_frxyz[atom].z);
 
         (*temp_uxyz).uint_x = tempux;
         (*temp_uxyz).uint_y = tempuy;
@@ -1834,11 +1857,14 @@ __global__ void ESP_Q_Spread_Order5(
             ESP_Eval_Window(window_table, window_coeff, table_points,
                             poly_order, use_poly, lane, temp_frxyz.z);
         sm_ix[cache_offset] =
-            ESP_Wrap_Subtract_Index(temp_uxyz.uint_x, lane, fftx);
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_x + ESP_ORDER5 - 1, lane,
+                                    fftx);
         sm_iy[cache_offset] =
-            ESP_Wrap_Subtract_Index(temp_uxyz.uint_y, lane, ffty);
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_y + ESP_ORDER5 - 1, lane,
+                                    ffty);
         sm_iz[cache_offset] =
-            ESP_Wrap_Subtract_Index(temp_uxyz.uint_z, lane, fftz);
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_z + ESP_ORDER5 - 1, lane,
+                                    fftz);
     }
     deviceSyncWarp(FULL_MASK);
     if (atom_valid)
@@ -1967,8 +1993,8 @@ __global__ void ESP_Q_Spread(
             float wy = wy_cache[ky];
             float wz = wz_cache[kz];
 #endif
-            int near_index = ESP_Get_Grid_Index(temp_uxyz, kx, ky, kz, fftx,
-                                                ffty, fftz, PME_Nin);
+            int near_index = ESP_Get_Grid_Index(temp_uxyz, kx, ky, kz, order,
+                                                fftx, ffty, fftz, PME_Nin);
             if ((unsigned int)near_index < (unsigned int)PME_Nall)
             {
                 atomicAdd(&PME_Q[near_index], tempcharge * wx * wy * wz);
@@ -2030,11 +2056,14 @@ __global__ void ESP_Final_Order5(
                             table_points, poly_order, use_poly, lane,
                             temp_frxyz.z);
         sm_ix[cache_offset] =
-            ESP_Wrap_Subtract_Index(temp_uxyz.uint_x, lane, fftx);
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_x + ESP_ORDER5 - 1, lane,
+                                    fftx);
         sm_iy[cache_offset] =
-            ESP_Wrap_Subtract_Index(temp_uxyz.uint_y, lane, ffty);
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_y + ESP_ORDER5 - 1, lane,
+                                    ffty);
         sm_iz[cache_offset] =
-            ESP_Wrap_Subtract_Index(temp_uxyz.uint_z, lane, fftz);
+            ESP_Wrap_Subtract_Index(temp_uxyz.uint_z + ESP_ORDER5 - 1, lane,
+                                    fftz);
     }
     deviceSyncWarp(FULL_MASK);
     if (atom_valid)
@@ -2268,8 +2297,8 @@ __global__ void ESP_Final(
         {
             int kx, ky, kz;
             ESP_Decompose_Window_Index(k, order, &kx, &ky, &kz);
-            int near_index = ESP_Get_Grid_Index(temp_uxyz, kx, ky, kz, fftx,
-                                                ffty, fftz, PME_Nin);
+            int near_index = ESP_Get_Grid_Index(temp_uxyz, kx, ky, kz, order,
+                                                fftx, ffty, fftz, PME_Nin);
             if ((unsigned int)near_index >= (unsigned int)PME_Nall) continue;
 #ifdef GPU_ARCH_NAME
             float wx = sm_wx[cache_offset + kx];
@@ -3104,7 +3133,8 @@ void Particle_Mesh::Destroy_Stream() { deviceStreamDestroy(pm_stream); }
 
 static __global__ void MPI_PME_Excluded_Force_With_Atom_Energy_Correction(
     const int atom_numbers, const VECTOR* crd, const LTMatrix3 cell,
-    const LTMatrix3 rcell, const float* charge, const float pme_beta,
+    const LTMatrix3 rcell, const float* charge,
+    const PM_Direct_Parameters pm_direct,
     const int* excluded_list_start, const int* excluded_list,
     const int* excluded_atom_numbers, VECTOR* frc, float* atom_ene,
     float* this_ene, LTMatrix3* atom_virial, int need_energy, int need_virial,
@@ -3123,8 +3153,6 @@ static __global__ void MPI_PME_Excluded_Force_With_Atom_Energy_Correction(
             float charge_i = charge[local_i];
             float charge_j;
             float dr_abs;
-            float beta_dr;
-
             VECTOR r1 = crd[local_i], r2;
             VECTOR dr;
             float dr2;
@@ -3147,18 +3175,15 @@ static __global__ void MPI_PME_Excluded_Force_With_Atom_Energy_Correction(
                 // 假设剔除表中的原子对距离总是小于cutoff的，正常体系
 
                 dr_abs = sqrtf(dr2);
-                beta_dr = pme_beta * dr_abs;
-                frc_abs = beta_dr * TWO_DIVIDED_BY_SQRT_PI *
-                              expf(-beta_dr * beta_dr) +
-                          erfcf(beta_dr);
-                frc_abs = (frc_abs - 1.) / dr2 / dr_abs;
-                frc_abs = -charge_i * charge_j * frc_abs;
+                frc_abs = PM_Get_Excluded_Coulomb_Force(
+                    charge_i * charge_j, dr_abs, pm_direct);
                 frc_lin = frc_abs * dr;
                 if (factor > 0.6f) atomicAdd(frc + local_j, -frc_lin);
                 frc_record = frc_record + frc_lin;
                 if (need_energy)
-                    ene_lin -=
-                        factor * charge_i * charge_j * erff(beta_dr) / dr_abs;
+                    ene_lin += factor * PM_Get_Excluded_Coulomb_Energy(
+                                            charge_i * charge_j, dr_abs,
+                                            pm_direct);
                 if (need_virial)
                     virial_record =
                         virial_record -
@@ -3193,7 +3218,8 @@ void Particle_Mesh::MPI_PME_Excluded_Force_With_Atom_Energy(
             (local_atom_numbers + CONTROLLER::device_max_thread - 1) /
                 CONTROLLER::device_max_thread,
             CONTROLLER::device_max_thread, 0, NULL, local_atom_numbers, crd,
-            cell, rcell, charge, beta, excluded_list_start, excluded_list,
+            cell, rcell, charge, Get_PM_Direct_Parameters(),
+            excluded_list_start, excluded_list,
             excluded_atom_numbers, frc, atom_ene, d_correction_atom_energy,
             atom_virial, need_energy, need_virial, atom_local, atom_local_id,
             exclude_factor);
