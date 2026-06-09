@@ -52,71 +52,6 @@ static constexpr int ESP_GPU_SPREAD_ATOMS_PER_BLOCK = 4;
 static constexpr int ESP_GPU_FINAL_LANES_PER_ATOM = 8;
 static constexpr int ESP_GPU_FINAL_ATOMS_PER_BLOCK = 128;
 
-__global__ void ESP_Sanitize_Float_List(float* values, const int count)
-{
-    SIMPLE_DEVICE_FOR(index, count)
-    {
-        if (!PM_Float_Is_Bounded(values[index], 1.0e4f))
-        {
-            values[index] = 0.0f;
-        }
-    }
-}
-
-__global__ void ESP_Sanitize_Complex_List(FFT_COMPLEX* values, const int count)
-{
-    SIMPLE_DEVICE_FOR(index, count)
-    {
-        if (!PM_Float_Is_Bounded(REAL(values[index]), 1.0e8f))
-        {
-            REAL(values[index]) = 0.0f;
-        }
-        if (!PM_Float_Is_Bounded(IMAGINARY(values[index]), 1.0e8f))
-        {
-            IMAGINARY(values[index]) = 0.0f;
-        }
-    }
-}
-
-__global__ void ESP_Sanitize_Vector_List(VECTOR* values, const int count)
-{
-    SIMPLE_DEVICE_FOR(index, count)
-    {
-        if (!PM_Float_Is_Bounded(values[index].x, 1.0e5f))
-        {
-            values[index].x = 0.0f;
-        }
-        if (!PM_Float_Is_Bounded(values[index].y, 1.0e5f))
-        {
-            values[index].y = 0.0f;
-        }
-        if (!PM_Float_Is_Bounded(values[index].z, 1.0e5f))
-        {
-            values[index].z = 0.0f;
-        }
-    }
-}
-
-static __global__ void ESP_Sanitize_Final_Force(VECTOR* force,
-                                                const int atom_numbers)
-{
-    SIMPLE_DEVICE_FOR(atom_i, atom_numbers)
-    {
-        if (!PM_Float_Is_Bounded(force[atom_i].x, 1.0e3f))
-        {
-            force[atom_i].x = 0.0f;
-        }
-        if (!PM_Float_Is_Bounded(force[atom_i].y, 1.0e3f))
-        {
-            force[atom_i].y = 0.0f;
-        }
-        if (!PM_Float_Is_Bounded(force[atom_i].z, 1.0e3f))
-        {
-            force[atom_i].z = 0.0f;
-        }
-    }
-}
-
 static __global__ void ESP_Energy_Product(const int element_number,
                                           const float* list1,
                                           const float* list2, float* sum)
@@ -296,15 +231,9 @@ void Particle_Mesh::Validate_Direct_Force_Path(bool uses_selective_direct,
 
 void Particle_Mesh::Sanitize_Force(VECTOR* force, int atom_numbers) const
 {
-    if (backend != ParticleMeshBackend::ESP)
-    {
-        return;
-    }
-    Launch_Device_Kernel(
-        ESP_Sanitize_Final_Force,
-        (atom_numbers + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, force, atom_numbers);
+    (void)force;
+    (void)atom_numbers;
+    return;
 }
 
 void Run_ESP_Reciprocal_Energy_Backend(Particle_Mesh* pm, const float* charge,
@@ -387,18 +316,7 @@ void Run_ESP_Reciprocal_Force_Backend(
             pm->esp.spread_poly_order, use_poly, pm->ESP_window_table,
             pm->ESP_window_coeff);
     }
-    Launch_Device_Kernel(
-        ESP_Sanitize_Float_List,
-        (pm->PME_Nall + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, pm->PME_Q, pm->PME_Nall);
-
     SPONGE_FFT_WRAPPER::R2C(pm->PME_plan_r2c, pm->PME_Q, pm->PME_FQ);
-    Launch_Device_Kernel(
-        ESP_Sanitize_Complex_List,
-        (pm->PME_Nfft + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->PME_Nfft);
 
     blockSize = {CONTROLLER::device_warp,
                  CONTROLLER::device_max_thread / CONTROLLER::device_warp};
@@ -418,18 +336,8 @@ void Run_ESP_Reciprocal_Force_Backend(
             CONTROLLER::device_max_thread,
         CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->ESP_BC,
         pm->PME_Nfft);
-    Launch_Device_Kernel(
-        ESP_Sanitize_Complex_List,
-        (pm->PME_Nfft + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FQ, pm->PME_Nfft);
 
     SPONGE_FFT_WRAPPER::C2R(pm->PME_plan_c2r, pm->PME_FQ, pm->PME_FBCFQ);
-    Launch_Device_Kernel(
-        ESP_Sanitize_Float_List,
-        (pm->PME_Nall + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, pm->PME_FBCFQ, pm->PME_Nall);
 
     if (pm->esp.order == ESP_ORDER5)
     {
@@ -466,23 +374,11 @@ void Run_ESP_Reciprocal_Force_Backend(
             pm->ESP_window_derivative_coeff);
     }
     Launch_Device_Kernel(
-        ESP_Sanitize_Vector_List,
-        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, pm->force_backup,
-        pm->atom_numbers);
-
-    Launch_Device_Kernel(
         device_add_force,
         (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
             CONTROLLER::device_max_thread,
         CONTROLLER::device_max_thread, 0, NULL, pm->atom_numbers,
         pm->update_interval, force, pm->force_backup);
-    Launch_Device_Kernel(
-        ESP_Sanitize_Vector_List,
-        (pm->atom_numbers + CONTROLLER::device_max_thread - 1) /
-            CONTROLLER::device_max_thread,
-        CONTROLLER::device_max_thread, 0, NULL, force, pm->atom_numbers);
 }
 
 void Update_ESP_Box_Backend(Particle_Mesh* pm, LTMatrix3 rcell, float volume)
